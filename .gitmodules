@@ -1,0 +1,3 @@
+[submodule "SilesiaCorpus"]
+	path = SilesiaCorpus
+	url = https://github.com/MiloszKrajewski/SilesiaCorpus.git

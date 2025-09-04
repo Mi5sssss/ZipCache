@@ -53,7 +53,7 @@ struct subpage_index_entry {
 // Writing buffer entry for lazy compression
 struct buffer_entry {
     key_t key;
-    int value;
+    value_t value;
     char operation;  // 'I' for insert, 'D' for delete, 'U' for update
 };
 

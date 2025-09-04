@@ -274,7 +274,7 @@ static int flush_to_hashed_leaf(struct bplus_tree_compressed *ct_tree, struct bp
     // Process each operation from the buffer
     for (int i = 0; i < buffer->count; i++) {
         key_t key = buffer->entries[i].key;
-        int value = buffer->entries[i].value;
+        value_t value = buffer->entries[i].value;
         
         int sub_page_index = hash_key_to_sub_page(key, num_sub_pages);
         int start_index = sub_page_index * sub_page_capacity;
@@ -488,7 +488,7 @@ static int compress_leaf_node_with_metadata_ex(struct bplus_tree_compressed *ct_
 
             int capacity = ct_tree->tree->entries;
             int subcap = capacity / num_sub_pages;
-            size_t per_sub_uncompressed = (size_t)subcap * (sizeof(key_t) + sizeof(int));
+            size_t per_sub_uncompressed = (size_t)subcap * (sizeof(key_t) + sizeof(value_t));
 
             if (leaf_metadata[idx].subpage_index == NULL || leaf_metadata[idx].subpage_index_count < num_sub_pages) {
                 leaf_metadata[idx].subpage_index = calloc((size_t)num_sub_pages, sizeof(struct subpage_index_entry));
@@ -506,7 +506,7 @@ static int compress_leaf_node_with_metadata_ex(struct bplus_tree_compressed *ct_
                 for (int sp = 0; sp < num_sub_pages; sp++) {
                     int start = sp * subcap;
                     memcpy(tmp, &leaf->key[start], subcap * sizeof(key_t));
-                    memcpy(tmp + subcap * sizeof(key_t), &leaf->data[start], subcap * sizeof(int));
+                    memcpy(tmp + subcap * sizeof(key_t), &leaf->data[start], subcap * sizeof(value_t));
                     int max_out = MAX_COMPRESSED_SIZE - (int)offset;
                     if (max_out <= 0) { free(tmp); return -1; }
                     int out_len = LZ4_compress_default(tmp, leaf_metadata[idx].compressed_data + offset,
@@ -530,7 +530,7 @@ static int compress_leaf_node_with_metadata_ex(struct bplus_tree_compressed *ct_
                 for (int sp = 0; sp < num_sub_pages; sp++) {
                     int start = sp * subcap;
                     memcpy(tmp, &leaf->key[start], subcap * sizeof(key_t));
-                    memcpy(tmp + subcap * sizeof(key_t), &leaf->data[start], subcap * sizeof(int));
+                    memcpy(tmp + subcap * sizeof(key_t), &leaf->data[start], subcap * sizeof(value_t));
                     
                     size_t max_out = MAX_COMPRESSED_SIZE - offset;
                     if (max_out <= 0) { 
@@ -596,7 +596,7 @@ static int decompress_leaf_partial_lz4(struct bplus_leaf *leaf, int metadata_idx
     if (leaf_metadata[metadata_idx].subpage_index == NULL) return -1;
     if (sub_page_index < 0 || sub_page_index >= leaf_metadata[metadata_idx].subpage_index_count) return -1;
     struct subpage_index_entry *ent = &leaf_metadata[metadata_idx].subpage_index[sub_page_index];
-    size_t tmp_size = (size_t)subcap * (sizeof(key_t) + sizeof(int));
+    size_t tmp_size = (size_t)subcap * (sizeof(key_t) + sizeof(value_t));
     char *tmp = (char*)malloc(tmp_size);
     if (!tmp) return -1;
     int out = LZ4_decompress_safe(leaf_metadata[metadata_idx].compressed_data + ent->offset,
@@ -606,7 +606,7 @@ static int decompress_leaf_partial_lz4(struct bplus_leaf *leaf, int metadata_idx
     if (out != (int)tmp_size) { free(tmp); return -1; }
     int start = sub_page_index * subcap;
     memcpy(&leaf->key[start], tmp, subcap * sizeof(key_t));
-    memcpy(&leaf->data[start], tmp + subcap * sizeof(key_t), subcap * sizeof(int));
+    memcpy(&leaf->data[start], tmp + subcap * sizeof(key_t), subcap * sizeof(value_t));
     free(tmp);
     return 0;
 }
@@ -618,7 +618,7 @@ static int decompress_leaf_partial_qpl(struct bplus_tree_compressed *ct_tree, st
     if (!ct_tree->qpl_job_ptr) return -1; /* QPL not initialized */
     
     struct subpage_index_entry *ent = &leaf_metadata[metadata_idx].subpage_index[sub_page_index];
-    size_t tmp_size = (size_t)subcap * (sizeof(key_t) + sizeof(int));
+    size_t tmp_size = (size_t)subcap * (sizeof(key_t) + sizeof(value_t));
     char *tmp = (char*)malloc(tmp_size);
     if (!tmp) return -1;
     
@@ -644,7 +644,7 @@ static int decompress_leaf_partial_qpl(struct bplus_tree_compressed *ct_tree, st
     
     int start = sub_page_index * subcap;
     memcpy(&leaf->key[start], tmp, subcap * sizeof(key_t));
-    memcpy(&leaf->data[start], tmp + subcap * sizeof(key_t), subcap * sizeof(int));
+    memcpy(&leaf->data[start], tmp + subcap * sizeof(key_t), subcap * sizeof(value_t));
     free(tmp);
     return 0;
 }
@@ -765,7 +765,7 @@ int bplus_tree_compressed_put(struct bplus_tree_compressed *ct_tree, key_t key, 
         fprintf(stderr, "compressed_put: invalid tree state\n");
         return -1;
     }
-    fprintf(stderr, "compressed_put: key=%d data=%d algo=%d\n", (int)key, data, ct_tree->config.algo);
+    // fprintf(stderr, "compressed_put: key=%d data=%d algo=%d\n", (int)key, data, ct_tree->config.algo);
     
     pthread_rwlock_wrlock(&ct_tree->rwlock);
     

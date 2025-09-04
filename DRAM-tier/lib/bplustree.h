@@ -12,7 +12,10 @@
 #define BPLUS_MAX_ENTRIES   64
 #define BPLUS_MAX_LEVEL     10
 
+#include <stdint.h>
 typedef int key_t;
+/* Generic value type that can hold integers or pointers */
+typedef uintptr_t value_t;
 
 #ifndef BPLUSTREE_LIST_ONCE
 #define BPLUSTREE_LIST_ONCE
@@ -146,8 +149,8 @@ struct bplus_leaf {
         int entries;
 /**  key array */
         int key[BPLUS_MAX_ENTRIES];
-/**  val array */
-        int data[BPLUS_MAX_ENTRIES];
+/**  val array (generic) */
+        value_t data[BPLUS_MAX_ENTRIES];
 
 };
 /** b plus tree structure */
@@ -210,5 +213,4 @@ struct bplus_tree *bplus_tree_init(int order, int entries);
 void bplus_tree_deinit(struct bplus_tree *tree);
 
 #endif  /* _BPLUS_TREE_DRAM_H */
-
 

@@ -81,3 +81,26 @@ bplus_tree_compressed_deinit(t);
   year={2024}
 }
 ```
+
+## Implementation Checklist
+
+Implemented
+- DRAM tier: dynamic B+ tree with fixed per-node capacity; compressed leaves with per-leaf metadata and subpage index; hash-guided sub-pages for early termination; per-page write buffer with background flush; LZ4 and Intel QPL software paths.
+- SSD tier: on-disk B+ tree present; super‑leaf concept documented; zipcache coordinator hooks in place.
+- Large objects: LO‑tier present with SSD-resident storage and in‑memory index.
+- Benchmarks/results: synthetic compression benchmark and legacy tests; Silesia corpus currently vendored.
+- Docs: paper‑aligned README with original compression results table.
+
+TODO
+- Expose config knobs (leaf `entries`, `default_sub_pages`, buffer thresholds, codec) via CLI/env in benchmarks.
+- Add unit tests for: hashed leaf split/merge, buffer flush correctness, partial LZ4/QPL parity, tombstone flows.
+- CMake options for QPL on/off and codec choice; add CI (build + smoke tests).
+- SSD-tier: validate super‑leaf hashing; implement page‑based DRAM→SSD eviction path and WA_host metrics.
+- Adaptive compression bypassing: hotness counters, promotion/demotion, telemetry.
+- Write amplification telemetry: WA_host and WR_NAND estimates; export stats API.
+- Implement `SCAN` across DRAM/SSD/LO with merged results and microbenchmarks.
+- Large object flows: verify 4KB‑aligned IO and tombstone interaction.
+- Memory accounting for metadata/buffers with caps and back‑pressure.
+- CSD integration: device detection, under‑filling policy, optional ZNS/Streams awareness.
+- Automated performance sweeps across sizes/locality/compressibility/leaf/sub‑pages; publish scripts and charts.
+

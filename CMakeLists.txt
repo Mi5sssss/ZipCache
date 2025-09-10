@@ -28,13 +28,21 @@ if(BUILD_SSD_TIER)
     add_subdirectory(SSD-tier)
 endif()
 
-# Create comparison tools directory
-add_subdirectory(comparison)
+# Create comparison tools directory (optional)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/comparison/CMakeLists.txt")
+    add_subdirectory(comparison)
+else()
+    message(STATUS "Skipping 'comparison' tools: directory not found")
+endif()
 
-# Focused ZipCache thresholds test (built via CMake to avoid header conflicts)
-add_executable(zipcache_thresholds_test
-    zipcache.c
-    tests/zipcache_thresholds_test.c
-)
-target_compile_definitions(zipcache_thresholds_test PRIVATE _GNU_SOURCE)
-target_link_libraries(zipcache_thresholds_test pthread)
+# Focused ZipCache thresholds test (optional)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/zipcache_thresholds_test.c")
+    add_executable(zipcache_thresholds_test
+        zipcache.c
+        tests/zipcache_thresholds_test.c
+    )
+    target_compile_definitions(zipcache_thresholds_test PRIVATE _GNU_SOURCE)
+    target_link_libraries(zipcache_thresholds_test pthread)
+else()
+    message(STATUS "Skipping 'zipcache_thresholds_test': test source not found")
+endif()

@@ -20,9 +20,14 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LZ4 REQUIRED liblz4)
 find_package(Threads REQUIRED)
 
-# Find Intel QPL library
-find_library(QPL_LIBRARY qpl HINTS /usr/local/lib)
-find_path(QPL_INCLUDE_DIR qpl/qpl.h HINTS /usr/local/include)
+# Find Intel QPL library (portable)
+# Allow users to specify via environment variable QPL_ROOT or CMAKE_PREFIX_PATH
+find_library(QPL_LIBRARY qpl
+    HINTS $ENV{QPL_ROOT}/lib
+)
+find_path(QPL_INCLUDE_DIR qpl/qpl.h
+    HINTS $ENV{QPL_ROOT}/include
+)
 
 if(QPL_LIBRARY AND QPL_INCLUDE_DIR)
     message(STATUS "Found Intel QPL: ${QPL_LIBRARY}")

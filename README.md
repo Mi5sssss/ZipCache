@@ -18,6 +18,8 @@ Paper: Xie, Ma, Zhong, Chen, Zhang. “ZipCache: A DRAM/SSD Cache with Built‑i
   - `mkdir build && cd build && cmake .. && make -j$(nproc)`
 - DRAM tier benchmark
   - `cd DRAM-tier/build && ./bin/synthetic_compression_benchmark`
+- Real-data benchmark (Silesia samba.zip)
+  - `cd DRAM-tier/build && ./bin/samba_zip_compression_benchmark`
 - Smoke tests
   - `./bin/bpt_compressed_lz4_smoke` and `./bin/bpt_compressed_qpl_smoke`
 
@@ -103,4 +105,3 @@ TODO
 - Memory accounting for metadata/buffers with caps and back‑pressure.
 - CSD integration: device detection, under‑filling policy, optional ZNS/Streams awareness.
 - Automated performance sweeps across sizes/locality/compressibility/leaf/sub‑pages; publish scripts and charts.
-

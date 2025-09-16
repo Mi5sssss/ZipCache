@@ -119,7 +119,7 @@ void test_tree_with_splitting() {
     unlink("/mnt/zipcache_test/tree_split_test.dat");
     
     // Initialize tree
-    struct bplus_tree *tree = bplus_tree_init(SPLIT_TEST_ORDER, SPLIT_TEST_ENTRIES, "tree_split_test.dat");
+    struct bplus_tree_ssd *tree = bplus_tree_ssd_init(SPLIT_TEST_ORDER, SPLIT_TEST_ENTRIES, "tree_split_test.dat");
     assert(tree != NULL);
     printf("✓ Tree initialized\n");
     
@@ -129,7 +129,7 @@ void test_tree_with_splitting() {
     
     int successful_inserts = 0;
     for (int i = 1; i <= test_keys; i++) {
-        int result = bplus_tree_put(tree, i, i * 10);
+        int result = bplus_tree_ssd_put(tree, i, i * 10);
         if (result == 0) {
             successful_inserts++;
         }
@@ -145,7 +145,7 @@ void test_tree_with_splitting() {
     printf("🔍 Testing retrievals after splitting...\n");
     int successful_gets = 0;
     for (int i = 1; i <= successful_inserts; i++) {
-        long value = bplus_tree_get(tree, i);
+        long value = bplus_tree_ssd_get(tree, i);
         if (value == i * 10) {
             successful_gets++;
         } else if (i <= 10) {  // Show first few misses
@@ -165,7 +165,7 @@ void test_tree_with_splitting() {
     for (int i = 0; i < num_specific; i++) {
         int key = test_specific[i];
         if (key <= successful_inserts) {
-            long value = bplus_tree_get(tree, key);
+            long value = bplus_tree_ssd_get(tree, key);
             printf("  Key %d: %s (expected %d, got %ld)\n", 
                    key, 
                    value == key * 10 ? "✓" : "✗",
@@ -176,10 +176,10 @@ void test_tree_with_splitting() {
     
     // Dump tree information
     printf("\n📊 Final tree state:\n");
-    bplus_tree_dump(tree);
+    bplus_tree_ssd_dump(tree);
     
     // Cleanup
-    bplus_tree_deinit(tree);
+    bplus_tree_ssd_deinit(tree);
     unlink("/mnt/zipcache_test/tree_split_test.dat");
     printf("✓ Tree splitting test completed\n\n");
 }

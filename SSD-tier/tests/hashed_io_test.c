@@ -220,14 +220,14 @@ void test_hybrid_tree_with_hashed_io() {
     unlink("/mnt/zipcache_test/hybrid_hashed_test.dat");
     
     // Initialize tree
-    struct bplus_tree *tree = bplus_tree_init(8, 64, "hybrid_hashed_test.dat");
+    struct bplus_tree_ssd *tree = bplus_tree_ssd_init(8, 64, "hybrid_hashed_test.dat");
     assert(tree != NULL);
     printf("✓ Hybrid tree initialized with hashed I/O\n");
     
     // Test insertions with hash distribution
     printf("\n📊 Testing insertions with hash-based distribution:\n");
     for (int i = 1; i <= TEST_KEYS; i++) {
-        int result = bplus_tree_put(tree, i, i * 10);
+        int result = bplus_tree_ssd_put(tree, i, i * 10);
         if (i % 10 == 0 || i <= 5) {
             int sub_page_idx = hash_key_to_sub_page(i, SUB_PAGES_PER_SUPER_LEAF);
             printf("Key %2d → Sub-page %2d: %s\n", 
@@ -239,7 +239,7 @@ void test_hybrid_tree_with_hashed_io() {
     printf("\n📊 Testing retrievals with hashed access:\n");
     int correct_retrievals = 0;
     for (int i = 1; i <= TEST_KEYS; i++) {
-        long value = bplus_tree_get(tree, i);
+        long value = bplus_tree_ssd_get(tree, i);
         if (value == i * 10) {
             correct_retrievals++;
         }
@@ -255,10 +255,10 @@ void test_hybrid_tree_with_hashed_io() {
     
     // Dump tree information
     printf("\nTree Information:\n");
-    bplus_tree_dump(tree);
+    bplus_tree_ssd_dump(tree);
     
     // Cleanup
-    bplus_tree_deinit(tree);
+    bplus_tree_ssd_deinit(tree);
     unlink("/mnt/zipcache_test/hybrid_hashed_test.dat");
     printf("✓ Hybrid tree with hashed I/O test completed\n\n");
 }

@@ -12,18 +12,28 @@
 void test_basic_operations() {
     printf("Testing basic hybrid B+tree operations...\n");
     
-    // Remove test file if it exists
-    unlink("/tmp/test_hybrid_btree.dat");
+    // // Remove test file if it exists
+    // unlink("/tmp/test_hybrid_btree.dat");
     
+    // // Initialize tree
+    // struct bplus_tree *tree = bplus_tree_init(TEST_ORDER, TEST_ENTRIES, "/tmp/test_hybrid_btree.dat");
+    
+    
+    const char *tree_path = "/tmp/test_hybrid_btree.dat";
+
+    // Remove test file if it exists
+    unlink(tree_path);
+
     // Initialize tree
-    struct bplus_tree *tree = bplus_tree_init(TEST_ORDER, TEST_ENTRIES, "/tmp/test_hybrid_btree.dat");
+    struct bplus_tree_ssd *tree = bplus_tree_ssd_init(TEST_ORDER, TEST_ENTRIES, tree_path);
     assert(tree != NULL);
     printf("✓ Tree initialization successful\n");
     
     // Test insertions
     printf("Inserting %d key-value pairs...\n", TEST_KEYS);
     for (int i = 0; i < TEST_KEYS; i++) {
-        int result = bplus_tree_put(tree, i, i * 10);
+        // int result = bplus_tree_put(tree, i, i * 10);
+        int result = bplus_tree_ssd_put(tree, i, i * 10);
         if (result != 0) {
             printf("✗ Insert failed for key %d\n", i);
         } else {
@@ -34,7 +44,7 @@ void test_basic_operations() {
     // Test retrievals
     printf("Testing retrievals...\n");
     for (int i = 0; i < TEST_KEYS; i++) {
-        long value = bplus_tree_get(tree, i);
+        long value = bplus_tree_ssd_get(tree, i);
         if (value == i * 10) {
             printf("✓ Retrieved key %d: expected %d, got %ld\n", i, i * 10, value);
         } else {
@@ -43,7 +53,8 @@ void test_basic_operations() {
     }
     
     // Test non-existent key
-    long non_existent = bplus_tree_get(tree, 999);
+    // long non_existent = bplus_tree_get(tree, 999);
+    long non_existent = bplus_tree_ssd_get(tree, 999);
     if (non_existent == -1) {
         printf("✓ Non-existent key correctly returned -1\n");
     } else {
@@ -52,11 +63,14 @@ void test_basic_operations() {
     
     // Dump tree structure
     printf("Tree structure:\n");
-    bplus_tree_dump(tree);
+    // bplus_tree_dump(tree);
+    bplus_tree_ssd_dump(tree);
     
     // Cleanup
-    bplus_tree_deinit(tree);
-    unlink("/tmp/test_hybrid_btree.dat");
+    // bplus_tree_deinit(tree);
+    // unlink("/tmp/test_hybrid_btree.dat");
+    bplus_tree_ssd_deinit(tree);
+    unlink(tree_path);
     printf("✓ Cleanup completed\n");
 }
 
@@ -73,7 +87,8 @@ void test_disk_operations() {
     
     // Create a test leaf
     struct bplus_leaf_disk *leaf = calloc(1, sizeof(*leaf));
-    leaf->type = BPLUS_TREE_LEAF;
+    // leaf->type = BPLUS_TREE_LEAF;
+    leaf->type = BPLUS_SSD_TREE_LEAF;
     leaf->entries = 3;
     leaf->key[0] = 10; leaf->data[0] = 100;
     leaf->key[1] = 20; leaf->data[1] = 200;

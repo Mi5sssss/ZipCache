@@ -178,6 +178,7 @@ void test_disk_write_with_zero_padding() {
     printf("\n💾 Writing sub-page to disk with automatic zero-padding...\n");
     int result = disk_write_sub_page(dm, block_id, sub_page);
     assert(result == 0);
+    (void)result;
     
     // Read back and verify
     printf("\n📖 Reading sub-page back from disk...\n");
@@ -298,7 +299,7 @@ void test_hybrid_tree_compression() {
     unlink("/mnt/zipcache_test/hybrid_compression_test.dat");
     
     // Initialize tree
-    struct bplus_tree *tree = bplus_tree_init(8, 64, "hybrid_compression_test.dat");
+    struct bplus_tree_ssd *tree = bplus_tree_ssd_init(8, 64, "hybrid_compression_test.dat");
     assert(tree != NULL);
     printf("✓ Hybrid tree initialized\n");
     
@@ -309,7 +310,7 @@ void test_hybrid_tree_compression() {
     
     for (int i = 0; i < num_sparse; i++) {
         int key = sparse_keys[i];
-        int result = bplus_tree_put(tree, key, key * 777);
+        int result = bplus_tree_ssd_put(tree, key, key * 777);
         if (result == 0) {
             int sub_page_idx = hash_key_to_sub_page(key, SUB_PAGES_PER_SUPER_LEAF);
             printf("  Inserted key %4d → sub-page %2d\n", key, sub_page_idx);
@@ -320,7 +321,7 @@ void test_hybrid_tree_compression() {
     printf("\n🔍 Testing retrieval of sparse data...\n");
     for (int i = 0; i < num_sparse; i++) {
         int key = sparse_keys[i];
-        long value = bplus_tree_get(tree, key);
+        long value = bplus_tree_ssd_get(tree, key);
         if (value == key * 777) {
             printf("  Key %4d: ✓ (value %ld)\n", key, value);
         } else {
@@ -335,7 +336,7 @@ void test_hybrid_tree_compression() {
     printf("  Expected compression ratio: >90%% for sparse patterns\n");
     
     // Cleanup
-    bplus_tree_deinit(tree);
+    bplus_tree_ssd_deinit(tree);
     unlink("/mnt/zipcache_test/hybrid_compression_test.dat");
     printf("✓ Hybrid tree compression test completed\n\n");
 }

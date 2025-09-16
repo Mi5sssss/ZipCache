@@ -33,6 +33,7 @@ void test_block_allocator() {
     uint32_t blocks[16];
     int result = allocate_multiple_blocks(allocator, 16, blocks);
     assert(result == 0);
+    (void)result;
     printf("✓ Allocated 16 blocks successfully\n");
     
     // Test block freeing
@@ -59,6 +60,7 @@ void test_sub_page_operations() {
     for (int i = 1; i <= 10; i++) {
         int result = sub_page_insert(sub_page, i, i * 100);
         assert(result == 0);
+        (void)result;
     }
     printf("✓ Inserted 10 key-value pairs into sub-page\n");
     
@@ -66,12 +68,14 @@ void test_sub_page_operations() {
     for (int i = 1; i <= 10; i++) {
         long value = sub_page_search(sub_page, i);
         assert(value == i * 100);
+        (void)value;
     }
     printf("✓ All searches successful\n");
     
     // Test non-existent key
     long non_existent = sub_page_search(sub_page, 999);
     assert(non_existent == -1);
+    (void)non_existent;
     printf("✓ Non-existent key correctly returned -1\n");
     
     // Test capacity
@@ -102,6 +106,7 @@ void test_disk_io() {
     
     int write_result = disk_write_sub_page(dm, block_id, sub_page);
     assert(write_result == 0);
+    (void)write_result;
     printf("✓ Sub-page written to disk\n");
     
     // Read sub-page back
@@ -114,6 +119,7 @@ void test_disk_io() {
     for (int i = 1; i <= 5; i++) {
         long value = sub_page_search(read_sub_page, i * 10);
         assert(value == i * 1000);
+        (void)value;
     }
     printf("✓ Disk I/O verification successful\n");
     
@@ -164,6 +170,7 @@ void test_super_leaf_operations() {
     // Test non-existent key
     long non_existent = super_leaf_search(dm, super_leaf, 999);
     assert(non_existent == -1);
+    (void)non_existent;
     printf("✓ Non-existent key correctly returned -1\n");
     
     // Show block allocation
@@ -187,7 +194,7 @@ void test_hybrid_tree_with_super_leaf() {
     unlink("/mnt/zipcache_test/hybrid_super_leaf_test.dat");
     
     // Initialize tree
-    struct bplus_tree *tree = bplus_tree_init(TEST_ORDER, TEST_ENTRIES, "hybrid_super_leaf_test.dat");
+    struct bplus_tree_ssd *tree = bplus_tree_ssd_init(TEST_ORDER, TEST_ENTRIES, "hybrid_super_leaf_test.dat");
     assert(tree != NULL);
     printf("✓ Hybrid tree initialized\n");
     
@@ -195,7 +202,7 @@ void test_hybrid_tree_with_super_leaf() {
     printf("Inserting %d key-value pairs...\n", TEST_KEYS);
     int successful_inserts = 0;
     for (int i = 1; i <= TEST_KEYS; i++) {
-        int result = bplus_tree_put(tree, i, i * 100);
+        int result = bplus_tree_ssd_put(tree, i, i * 100);
         if (result == 0) {
             successful_inserts++;
         }
@@ -210,7 +217,7 @@ void test_hybrid_tree_with_super_leaf() {
     printf("Testing retrievals...\n");
     int successful_gets = 0;
     for (int i = 1; i <= successful_inserts; i++) {
-        long value = bplus_tree_get(tree, i);
+        long value = bplus_tree_ssd_get(tree, i);
         if (value == i * 100) {
             successful_gets++;
         }
@@ -225,7 +232,7 @@ void test_hybrid_tree_with_super_leaf() {
     for (int i = 0; i < num_test_keys; i++) {
         int key = test_keys[i];
         if (key <= successful_inserts) {
-            long value = bplus_tree_get(tree, key);
+            long value = bplus_tree_ssd_get(tree, key);
             printf("  Key %d: %s (expected %d, got %ld)\n", 
                    key, 
                    value == key * 100 ? "✓" : "✗",
@@ -235,13 +242,13 @@ void test_hybrid_tree_with_super_leaf() {
     }
     
     // Test non-existent key
-    long non_existent = bplus_tree_get(tree, 9999);
+    long non_existent = bplus_tree_ssd_get(tree, 9999);
     printf("  Non-existent key 9999: %s (got %ld)\n", 
            non_existent == -1 ? "✓" : "✗", non_existent);
     
     // Dump tree information
     printf("\nTree Information:\n");
-    bplus_tree_dump(tree);
+    bplus_tree_ssd_dump(tree);
     
     // Check file size
     struct stat st;
@@ -251,7 +258,7 @@ void test_hybrid_tree_with_super_leaf() {
     }
     
     // Cleanup
-    bplus_tree_deinit(tree);
+    bplus_tree_ssd_deinit(tree);
     unlink("/mnt/zipcache_test/hybrid_super_leaf_test.dat");
     printf("✓ Hybrid tree cleanup completed\n\n");
 }

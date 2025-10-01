@@ -1,5 +1,5 @@
 /*
- * B+Tree implementation
+ * Copyright (C) 2015, Leo Ma <begeekmyfriend@gmail.com>
  */
 
 #include <stdio.h>
@@ -320,7 +320,7 @@ static int non_leaf_insert(struct bplus_tree *tree, struct bplus_non_leaf *node,
 }
 
 static void leaf_split_left(struct bplus_leaf *leaf, struct bplus_leaf *left,
-                            key_t key, value_t data, int insert)
+                            key_t key, int data, int insert)
 {
         int i, j;
         /* split = [m/2] */
@@ -353,7 +353,7 @@ static void leaf_split_left(struct bplus_leaf *leaf, struct bplus_leaf *left,
 }
 
 static void leaf_split_right(struct bplus_leaf *leaf, struct bplus_leaf *right,
-                             key_t key, value_t data, int insert)
+                             key_t key, int data, int insert)
 {
         int i, j;
         /* split = [m/2] */
@@ -383,7 +383,7 @@ static void leaf_split_right(struct bplus_leaf *leaf, struct bplus_leaf *right,
         leaf->entries = split;
 }
 
-static void leaf_simple_insert(struct bplus_leaf *leaf, key_t key, value_t data, int insert)
+static void leaf_simple_insert(struct bplus_leaf *leaf, key_t key, int data, int insert)
 {
         int i;
         for (i = leaf->entries; i > insert; i--) {
@@ -395,43 +395,44 @@ static void leaf_simple_insert(struct bplus_leaf *leaf, key_t key, value_t data,
         leaf->entries++;
 }
 
-static struct bplus_node *leaf_insert(struct bplus_tree *tree, struct bplus_leaf *leaf, key_t key, value_t data)
+static int leaf_insert(struct bplus_tree *tree, struct bplus_leaf *leaf, key_t key, int data)
 {
         /* search key location */
         int insert = key_binary_search(leaf->key, leaf->entries, key);
         if (insert >= 0) {
                 /* Already exists */
-                return NULL;
+                return -1;
         }
         insert = -insert - 1;
 
         /* node full */
         if (leaf->entries == tree->entries) {
+                /* split = [m/2] */
+                int split = (tree->entries + 1) / 2;
                 /* splited sibling node */
                 struct bplus_leaf *sibling = leaf_new();
                 /* sibling leaf replication due to location of insertion */
-                if (insert < (tree->entries + 1) / 2) {
+                if (insert < split) {
                         leaf_split_left(leaf, sibling, key, data, insert);
                 } else {
                         leaf_split_right(leaf, sibling, key, data, insert);
                 }
                 /* build new parent */
-                if (insert < (tree->entries + 1) / 2) {
-                        parent_node_build(tree, (struct bplus_node *)sibling,
+                if (insert < split) {
+                        return parent_node_build(tree, (struct bplus_node *)sibling,
                                 (struct bplus_node *)leaf, leaf->key[0], 0);
                 } else {
-                        parent_node_build(tree, (struct bplus_node *)leaf,
+                        return parent_node_build(tree, (struct bplus_node *)leaf,
                                 (struct bplus_node *)sibling, sibling->key[0], 0);
                 }
-                return (struct bplus_node *)sibling;
         } else {
                 leaf_simple_insert(leaf, key, data, insert);
         }
 
-        return NULL;
+        return 0;
 }
 
-static struct bplus_node *bplus_tree_insert(struct bplus_tree *tree, key_t key, value_t data)
+static int bplus_tree_insert(struct bplus_tree *tree, key_t key, int data)
 {
         struct bplus_node *node = tree->root;
         while (node != NULL) {
@@ -457,7 +458,7 @@ static struct bplus_node *bplus_tree_insert(struct bplus_tree *tree, key_t key, 
         root->entries = 1;
         tree->root = (struct bplus_node *)root;
         list_add(&root->link, &tree->list[tree->level]);
-        return NULL;
+        return 0;
 }
 
 static int non_leaf_sibling_select(struct bplus_non_leaf *l_sib, struct bplus_non_leaf *r_sib,
@@ -792,13 +793,12 @@ int bplus_tree_get(struct bplus_tree *tree, key_t key)
         }
 }
 
-struct bplus_node *bplus_tree_put(struct bplus_tree *tree, key_t key, long data)
+int bplus_tree_put(struct bplus_tree *tree, key_t key, int data)
 {
         if (data) {
-                return bplus_tree_insert(tree, key, (value_t)(uintptr_t)data);
+                return bplus_tree_insert(tree, key, data);
         } else {
-                bplus_tree_delete(tree, key);
-                return NULL;
+                return bplus_tree_delete(tree, key);
         }
 }
 
@@ -883,15 +883,6 @@ int bplus_tree_get_range(struct bplus_tree *tree, key_t key1, key_t key2)
     }
 
     return data;
-}
-
-struct bplus_node *bplus_node_new(struct bplus_tree *tree, int type)
-{
-    if (type == BPLUS_TREE_LEAF) {
-        return (struct bplus_node *)leaf_new();
-    } else {
-        return (struct bplus_node *)non_leaf_new();
-    }
 }
 
 #ifdef _BPLUS_TREE_DEBUG

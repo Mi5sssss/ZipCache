@@ -34,7 +34,10 @@ set_target_properties(${LIB_BPLUSTREE_COMPRESSED_NAME} PROPERTIES
 )
 
 # Link compressed library with dependencies
-target_link_libraries(bplustree_compressed bplustree_static qpl lz4)
+target_link_libraries(bplustree_compressed
+    ${LZ4_LIBRARIES}
+    Threads::Threads
+)
 target_include_directories(${LIB_BPLUSTREE_COMPRESSED_NAME} PRIVATE ${LZ4_INCLUDE_DIRS})
 target_compile_options(${LIB_BPLUSTREE_COMPRESSED_NAME} PRIVATE ${LZ4_CFLAGS_OTHER})
 

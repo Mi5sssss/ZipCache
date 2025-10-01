@@ -6,11 +6,20 @@
 #include <pthread.h>
 #include <lz4.h>
 #include <qpl/qpl.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
 #include "bplustree.h"
 
 // 4KB leaf node size for optimal compression
 #define COMPRESSED_LEAF_SIZE 4096
 #define MAX_COMPRESSED_SIZE 8192  // Fixed size for LZ4 compression buffer
+
+// Legacy constants from btree.h
+#define KEY_SIZE 8
+#define LANDING_BUFFER_BYTES 512
+#define TOTAL_SUBPAGES_BYTES 4096
 
 
 
@@ -26,16 +35,32 @@ typedef enum {
     COMPRESS_QPL = 1
 } compression_algo_t;
 
-// Compression configuration
+// Legacy KV metadata structure
+struct kv_metadata {
+    unsigned char key[KEY_SIZE];
+    uint8_t value_type;
+    uint16_t value_size;
+};
+
+// Original compression configuration (kept for backward compatibility)
 struct compression_config {
-    // Layout is unified (hashed) for both algorithms; keep field for backward compat
     leaf_layout_t default_layout;
-    compression_algo_t algo;        // Global algorithm: LZ4 (early term) or QPL (full leaf)
-    int default_sub_pages;          // n: number of hashed sub-pages per leaf (e.g., 16)
-    int compression_level;          // For QPL (qpl_default_level, qpl_high_level)
-    int buffer_size;                // Configurable buffer size (default 512)
-    int flush_threshold;            // When to trigger background flush
-    int enable_lazy_compression;    // Enable/disable lazy compression
+    compression_algo_t algo;
+    int default_sub_pages;
+    int compression_level;
+    int buffer_size;
+    int flush_threshold;
+    int enable_lazy_compression;
+};
+
+// Simplified compression configuration for dual algorithm support
+struct simple_compression_config {
+    compression_algo_t default_algo;           // COMPRESS_LZ4 or COMPRESS_QPL
+    int num_subpages;                         // Number of hash buckets (legacy style)
+    int buffer_size;                          // Landing buffer size (default 512)
+    int lz4_partial_decompression;            // Enable partial decompression for LZ4
+    int qpl_compression_level;                // QPL compression level
+    int enable_background_compression;        // Background thread support
 };
 
 // Per–sub-page compressed block index entry for unified hashed layout
@@ -50,19 +75,35 @@ struct subpage_index_entry {
 #define MAX_BUFFER_ENTRIES 32        // Max KV pairs in buffer (16 bytes each)
 #define QPL_COMPRESSION_BUFFER_SIZE 16384  // 16KB buffer for QPL operations
 
-// Writing buffer entry for lazy compression
-struct buffer_entry {
-    key_t key;
-    value_t value;
-    char operation;  // 'I' for insert, 'D' for delete, 'U' for update
+// Simplified leaf node structure with legacy 1D layout + dual compression
+struct simple_leaf_node {
+    char landing_buffer[LANDING_BUFFER_BYTES];  // 512 bytes (legacy style)
+    char *compressed_data;                      // Single compressed block
+    int compressed_size;                        // Size of compressed data
+    int num_subpages;                          // Number of hash buckets (legacy)
+    bool is_compressed;                        // Compression state
+    compression_algo_t compression_algo;       // LZ4 or QPL (stored per leaf)
+
+    // LZ4-specific fields (only used when algo == COMPRESS_LZ4)
+    struct subpage_index_entry *subpage_index; // For partial decompression
+    int num_subpage_entries;                   // Number of indexed subpages
+
+    // Statistics
+    size_t uncompressed_bytes;
+    size_t compressed_bytes;
 };
 
-// Writing buffer for each leaf node
-struct writing_buffer {
-    struct buffer_entry entries[MAX_BUFFER_ENTRIES];
-    int count;                       // Number of entries in buffer
-    int dirty;                       // Flag indicating buffer has changes
-    pthread_mutex_t buffer_lock;     // Lock for this buffer
+// Keep original for backward compatibility
+struct custom_leaf_node {
+    char landing_buffer[WRITING_BUFFER_SIZE];
+    char *compressed_data;
+    int is_compressed;
+    int original_entries;
+    int compressed_size;
+    size_t uncompressed_bytes;
+    size_t compressed_bytes;
+    int num_sub_pages;
+    struct subpage_index_entry *subpage_index;
 };
 
 /* Deprecated: in-tree extended leaf struct not used with external metadata map */
@@ -103,6 +144,8 @@ struct bplus_tree_compressed {
     
     // Compression configuration
     struct compression_config config;       // User-defined compression settings
+    struct simple_compression_config simple_config;  // Simplified dual-algorithm configuration
+    int is_simple_mode;                     // Flag: 1 for simple API, 0 for legacy API
     
     // QPL support
     qpl_job *qpl_job_ptr;                  // QPL job for compression operations
@@ -115,6 +158,9 @@ struct bplus_tree_compressed {
     int shutdown_flag;                      // Flag to shutdown background thread
     int buffer_flush_threshold;             // Entries threshold to trigger flush
     
+    // Entry counting for compressed trees
+    int actual_entries;                     // Count of actual key-value pairs stored
+
     // Global compression statistics
     size_t total_uncompressed_size;         // Total uncompressed size
     size_t total_compressed_size;           // Total compressed size
@@ -224,6 +270,9 @@ int decompress_leaf_node_qpl(struct bplus_tree_compressed *ct_tree, struct bplus
  */
 int bplus_tree_compressed_put(struct bplus_tree_compressed *ct_tree, key_t key, int data);
 
+int bplus_tree_compressed_put_blob(struct bplus_tree_compressed *ct_tree, key_t key,
+                                   const uint8_t *payload, size_t payload_len);
+
 /**
  * Thread-safe get operation with decompression
  * @param ct_tree Pointer to compressed B+Tree
@@ -231,6 +280,9 @@ int bplus_tree_compressed_put(struct bplus_tree_compressed *ct_tree, key_t key, 
  * @return The value associated with the key, or -1 if not found
  */
 int bplus_tree_compressed_get(struct bplus_tree_compressed *ct_tree, key_t key);
+
+int bplus_tree_compressed_get_blob(struct bplus_tree_compressed *ct_tree, key_t key,
+                                   uint8_t *buffer, size_t buffer_len, size_t *actual_len);
 
 /**
  * Thread-safe delete operation with compression
@@ -317,11 +369,15 @@ double bplus_tree_compressed_get_compression_ratio(struct bplus_tree_compressed 
 int bplus_tree_compressed_get_algorithm_stats(struct bplus_tree_compressed *ct_tree,
                                               int *lz4_ops, int *qpl_ops);
 
+int bplus_tree_compressed_get_buffer_stats(struct bplus_tree_compressed *ct_tree,
+                                           int *buffer_hits, int *buffer_misses);
+
 /**
  * Print compressed tree structure for debugging
  * @param ct_tree Pointer to compressed B+Tree
  */
 void bplus_tree_compressed_dump(struct bplus_tree_compressed *ct_tree);
+
 
 /**
  * Force flush all buffers (useful for shutdown or consistency)
@@ -332,33 +388,7 @@ int bplus_tree_compressed_flush_all_buffers(struct bplus_tree_compressed *ct_tre
 
 // Internal lazy compression functions
 
-/**
- * Search for a key in the writing buffer
- * @param buffer Pointer to writing buffer
- * @param key The key to search for
- * @return Index if found, -1 if not found
- */
-int search_buffer(struct writing_buffer *buffer, key_t key);
 
-/**
- * Add an entry to the writing buffer
- * @param ct_tree Pointer to compressed B+Tree
- * @param leaf Pointer to leaf node
- * @param key The key
- * @param value The value
- * @param operation The operation type ('I', 'U', 'D')
- * @return 0 on success, -1 on failure (buffer full)
- */
-int add_to_buffer(struct bplus_tree_compressed *ct_tree, struct bplus_leaf *leaf,
-                  key_t key, int value, char operation);
-
-/**
- * Flush a writing buffer to the leaf node (background thread function)
- * @param ct_tree Pointer to compressed B+Tree (for config/algorithm/QPL)
- * @param leaf Pointer to leaf node
- * @return 0 on success, -1 on failure
- */
-int flush_buffer_to_leaf(struct bplus_tree_compressed *ct_tree, struct bplus_leaf *leaf);
 
 /**
  * Background thread function for lazy compression
@@ -386,5 +416,116 @@ void cleanup_qpl(struct bplus_tree_compressed *ct_tree);
  * @return Default compression configuration
  */
 struct compression_config bplus_tree_create_default_leaf_config(leaf_layout_t default_layout);
+
+// New simplified API functions
+
+/**
+ * Initialize B+Tree with simplified dual compression support
+ * @param order B+Tree order
+ * @param entries Max entries per leaf
+ * @param config Simplified compression configuration
+ * @return Pointer to compressed B+Tree, or NULL on failure
+ */
+struct bplus_tree_compressed *bplus_tree_compressed_init_simple(int order, int entries,
+                                                               struct simple_compression_config *config);
+
+/**
+ * Create default simple compression configuration
+ * @param algo Default compression algorithm (LZ4 or QPL)
+ * @return Default simple configuration
+ */
+struct simple_compression_config bplus_tree_create_default_simple_config(compression_algo_t algo);
+
+/**
+ * Main compression dispatch function (uses legacy hash distribution)
+ * @param ct_tree Pointer to compressed B+Tree
+ * @param leaf Pointer to simple leaf node
+ * @param subpages 4KB subpage array (legacy style)
+ * @return 0 on success, -1 on failure
+ */
+int compress_leaf_simple(struct bplus_tree_compressed *ct_tree,
+                        struct simple_leaf_node *leaf, char subpages[]);
+
+/**
+ * Main decompression dispatch function (algorithm-aware)
+ * @param ct_tree Pointer to compressed B+Tree
+ * @param leaf Pointer to simple leaf node
+ * @param subpages 4KB subpage array to decompress into
+ * @param subpage_idx Specific subpage index for LZ4 partial decompression (-1 for full)
+ * @return 0 on success, -1 on failure
+ */
+int decompress_leaf_simple(struct bplus_tree_compressed *ct_tree,
+                          struct simple_leaf_node *leaf, char subpages[],
+                          int subpage_idx);
+
+/**
+ * Legacy hash-based redistribution (ported from btree.cc)
+ * @param leaf Pointer to simple leaf node
+ * @param subpages 4KB subpage array
+ */
+void redistribute_subpages_legacy(struct simple_leaf_node *leaf, char subpages[]);
+
+/**
+ * Calculate target subpage for key using legacy hash
+ * @param key Key to hash
+ * @param num_subpages Number of subpages
+ * @return Subpage index
+ */
+int calculate_target_subpage_legacy(const char *key, int num_subpages);
+
+/**
+ * Search in leaf with algorithm-aware decompression
+ * @param ct_tree Pointer to compressed B+Tree
+ * @param leaf Pointer to simple leaf node
+ * @param key Key to search for
+ * @return Pointer to KV data or NULL if not found
+ */
+char* search_in_leaf_simple(struct bplus_tree_compressed *ct_tree,
+                            struct simple_leaf_node *leaf, const char *key);
+
+/**
+ * LZ4 compression with legacy hash distribution
+ * @param leaf Pointer to simple leaf node
+ * @param subpages 4KB subpage array
+ * @return 0 on success, -1 on failure
+ */
+int compress_leaf_lz4_legacy(struct simple_leaf_node *leaf, char subpages[]);
+
+/**
+ * QPL compression with legacy hash distribution
+ * @param ct_tree Pointer to compressed B+Tree (for QPL job)
+ * @param leaf Pointer to simple leaf node
+ * @param subpages 4KB subpage array
+ * @return 0 on success, -1 on failure
+ */
+int compress_leaf_qpl_legacy(struct bplus_tree_compressed *ct_tree,
+                             struct simple_leaf_node *leaf, char subpages[]);
+
+/**
+ * LZ4 partial decompression (single subpage)
+ * @param leaf Pointer to simple leaf node
+ * @param subpage_idx Subpage index to decompress
+ * @param output_buffer Buffer to store decompressed subpage
+ * @return 0 on success, -1 on failure
+ */
+int decompress_leaf_lz4_partial(struct simple_leaf_node *leaf, int subpage_idx, char *output_buffer);
+
+/**
+ * LZ4 full decompression (all subpages)
+ * @param leaf Pointer to simple leaf node
+ * @param subpages 4KB subpage array output
+ * @return 0 on success, -1 on failure
+ */
+int decompress_leaf_lz4_full(struct simple_leaf_node *leaf, char subpages[]);
+
+/**
+ * QPL full decompression (entire leaf)
+ * @param ct_tree Pointer to compressed B+Tree (for QPL job)
+ * @param leaf Pointer to simple leaf node
+ * @param subpages 4KB subpage array output
+ * @return 0 on success, -1 on failure
+ */
+int decompress_leaf_qpl_full(struct bplus_tree_compressed *ct_tree,
+                            struct simple_leaf_node *leaf, char subpages[]);
 
 #endif /* _BPLUS_TREE_COMPRESSED_H */

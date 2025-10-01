@@ -32,3 +32,19 @@ target_link_libraries(bpt_compressed_lz4_smoke ${LIB_BPLUSTREE_COMPRESSED_NAME})
 
 add_executable(bpt_compressed_qpl_smoke compressed_qpl_smoke.c)
 target_link_libraries(bpt_compressed_qpl_smoke ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Comprehensive test for legacy 1D design with dual compression
+add_executable(test_legacy_simple_compression test_legacy_simple_compression.c)
+target_link_libraries(test_legacy_simple_compression ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Performance benchmark for legacy compression
+add_executable(benchmark_legacy_compression benchmark_legacy_compression.c)
+target_link_libraries(benchmark_legacy_compression ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Simple basic test for legacy compression
+add_executable(simple_test_legacy simple_test_legacy.c)
+target_link_libraries(simple_test_legacy ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Minimal test for basic functions
+add_executable(minimal_test minimal_test.c)
+target_link_libraries(minimal_test ${LIB_BPLUSTREE_COMPRESSED_NAME})

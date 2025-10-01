@@ -1,8 +1,9 @@
 # Compression examples and tests
 
-# Simple compressed test 
+# Simple compressed test
 add_executable(simple_compressed_test simple_compressed_test.c)
-target_link_libraries(simple_compressed_test ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+target_link_libraries(simple_compressed_test bplustree_compressed bplustree)
 
 # Performance test
 add_executable(compressed_performance_test compressed_performance_test.c) 
@@ -35,6 +36,10 @@ target_link_libraries(focused_compression_benchmark ${LIB_BPLUSTREE_COMPRESSED_N
 # Synthetic compression benchmark
 add_executable(synthetic_compression_benchmark synthetic_compression_benchmark.c)
 target_link_libraries(synthetic_compression_benchmark ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Mixed workload compression benchmark
+add_executable(mixed_workload_compression_benchmark mixed_workload_compression_benchmark.c)
+target_link_libraries(mixed_workload_compression_benchmark ${LIB_BPLUSTREE_COMPRESSED_NAME})
 
 # Samba.zip chunk compression benchmark
 add_executable(samba_zip_compression_benchmark samba_zip_compression_benchmark.c)

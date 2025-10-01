@@ -32,7 +32,7 @@ int main(void) {
     printf("after put 13 -> base get %d\n", bplus_tree_get(ct->tree, 13));
 
     // Optional: dump compressed tree state for debugging
-    bplus_tree_compressed_dump(ct);
+    
 
     // Also exercise base tree directly to verify core insert/get
     bplus_tree_put(ct->tree, 21, 221);

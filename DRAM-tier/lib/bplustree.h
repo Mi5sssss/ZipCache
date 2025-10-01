@@ -203,14 +203,8 @@ int bplus_tree_get_range(struct bplus_tree *tree, key_t key1, key_t key2);
    
 */
 struct bplus_tree *bplus_tree_init(int order, int entries);
- /** destory the tree safely
-  * @return a pointer to tree
-   * @param order  The actual number of children for a node, referred to here as order 
-   * @param entries   number of actual key-value pairs in tree 
-   
-   
-*/
 void bplus_tree_deinit(struct bplus_tree *tree);
+struct bplus_node *bplus_node_new(struct bplus_tree *tree, int type);
 
 #endif  /* _BPLUS_TREE_DRAM_H */
 

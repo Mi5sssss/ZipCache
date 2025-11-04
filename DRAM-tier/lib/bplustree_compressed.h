@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <lz4.h>
+#include <lz4hc.h>
 #include <qpl/qpl.h>
 #include <stdbool.h>
 #include <stdint.h>

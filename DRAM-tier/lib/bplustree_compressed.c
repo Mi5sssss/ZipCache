@@ -1,4 +1,3 @@
-/* File cleaned: removed stray characters */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,6 +183,32 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
         if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
             return (int)produced;
         }
+    }
+
+    int level = ct_tree->config.compression_level;
+    if (level < 0) {
+        int acceleration = -level;
+        if (acceleration <= 0) {
+            acceleration = 1;
+        }
+        return LZ4_compress_fast((const char *)src,
+                                 (char *)dst,
+                                 (int)src_size,
+                                 (int)dst_capacity,
+                                 acceleration);
+    }
+
+    if (level > 1) {
+#ifdef LZ4HC_CLEVEL_MAX
+        if (level > LZ4HC_CLEVEL_MAX) {
+            level = LZ4HC_CLEVEL_MAX;
+        }
+#endif
+        return LZ4_compress_HC((const char *)src,
+                               (char *)dst,
+                               (int)src_size,
+                               (int)dst_capacity,
+                               level);
     }
 
     return LZ4_compress_default((const char *)src, (char *)dst, (int)src_size, (int)dst_capacity);
@@ -1553,65 +1578,40 @@ int bplus_tree_compressed_get(struct bplus_tree_compressed *ct_tree, key_t key)
         sub_page_size = COMPRESSED_LEAF_SIZE;
     }
 
-    if (custom_leaf->compression_algo == COMPRESS_QPL) {
-        char uncompressed_pages[COMPRESSED_LEAF_SIZE];
-        memset(uncompressed_pages, 0, COMPRESSED_LEAF_SIZE);
-        for (int i = 0; i < custom_leaf->num_subpages; i++) {
-            struct subpage_index_entry *entry = &custom_leaf->subpage_index[i];
-            if (!entry || entry->length <= 0) {
-                continue;
-            }
-            int rc = decompress_subpage(ct_tree,
-                                        custom_leaf,
-                                        (const uint8_t *)custom_leaf->compressed_data + entry->offset,
-                                        entry->length,
-                                        (uint8_t *)(uncompressed_pages + i * sub_page_size),
-                                        sub_page_size);
-            if (rc < 0) {
-                pthread_rwlock_unlock(&custom_leaf->rwlock);
-                return -1;
-            }
-        }
-        struct kv_pair *p_full = (struct kv_pair *)uncompressed_pages;
-        struct kv_pair *end_full = (struct kv_pair *)(uncompressed_pages + COMPRESSED_LEAF_SIZE);
-        while (p_full < end_full) {
-            if (p_full->key == key) {
-                result = p_full->value;
-                break;
-            }
-            p_full++;
-        }
-    } else {
-        struct subpage_index_entry *entry = &custom_leaf->subpage_index[target_bucket];
-        char *buffer = malloc(sub_page_size);
-        if (!buffer) {
-            pthread_rwlock_unlock(&custom_leaf->rwlock);
-            return -1;
-        }
-
-        int rc = decompress_subpage(ct_tree,
-                                    custom_leaf,
-                                    (const uint8_t *)custom_leaf->compressed_data + entry->offset,
-                                    entry->length,
-                                    (uint8_t *)buffer,
-                                    sub_page_size);
-        if (rc < 0) {
-            free(buffer);
-            pthread_rwlock_unlock(&custom_leaf->rwlock);
-            return -1;
-        }
-
-        struct kv_pair *sp = (struct kv_pair *)buffer;
-        struct kv_pair *sp_end = sp + (sub_page_size / (int)sizeof(struct kv_pair));
-        while (sp < sp_end) {
-            if (sp->key == key) {
-                result = sp->value;
-                break;
-            }
-            sp++;
-        }
-        free(buffer);
+    struct subpage_index_entry *entry = &custom_leaf->subpage_index[target_bucket];
+    if (!entry || entry->length <= 0) {
+        pthread_rwlock_unlock(&custom_leaf->rwlock);
+        return -1;
     }
+
+    char *buffer = malloc(sub_page_size);
+    if (!buffer) {
+        pthread_rwlock_unlock(&custom_leaf->rwlock);
+        return -1;
+    }
+
+    int rc = decompress_subpage(ct_tree,
+                                custom_leaf,
+                                (const uint8_t *)custom_leaf->compressed_data + entry->offset,
+                                entry->length,
+                                (uint8_t *)buffer,
+                                sub_page_size);
+    if (rc < 0) {
+        free(buffer);
+        pthread_rwlock_unlock(&custom_leaf->rwlock);
+        return -1;
+    }
+
+    struct kv_pair *sp = (struct kv_pair *)buffer;
+    struct kv_pair *sp_end = sp + (sub_page_size / (int)sizeof(struct kv_pair));
+    while (sp < sp_end) {
+        if (sp->key == key) {
+            result = sp->value;
+            break;
+        }
+        sp++;
+    }
+    free(buffer);
 
     pthread_rwlock_unlock(&custom_leaf->rwlock);
     return result;

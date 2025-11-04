@@ -63,3 +63,9 @@ target_link_libraries(bpt_compressed_synthetic_test ${LIB_BPLUSTREE_COMPRESSED_N
 add_executable(test_compression_concurrency test_compression_concurrency.c)
 target_link_libraries(test_compression_concurrency ${LIB_BPLUSTREE_COMPRESSED_NAME})
 target_link_libraries(test_compression_concurrency pthread)
+
+add_executable(tail_latency_compare compressed_tail_latency.c)
+target_link_libraries(tail_latency_compare ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+add_executable(dcperf_workload_benchmark compressed_dcperf_workload.c)
+target_link_libraries(dcperf_workload_benchmark ${LIB_BPLUSTREE_COMPRESSED_NAME} m)

@@ -23,6 +23,7 @@ Makefile
 *.db
 *.boot
 test_*
+!DRAM-tier/tests/test_compression_concurrency.c
 perf_test_*
 comparison_*
 

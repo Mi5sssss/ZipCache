@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,10 +11,10 @@
 
 #include "bplustree_compressed.h"
 
-#define DEFAULT_KEY_COUNT 8192
-#define DEFAULT_SAMPLE_COUNT 4096
+#define DEFAULT_KEY_COUNT 8192000
+#define DEFAULT_SAMPLE_COUNT 40960
 #define DEFAULT_NUM_SUBPAGES 16
-#define DEFAULT_WARMUP_COUNT 256
+#define DEFAULT_WARMUP_COUNT 2560000
 #define UPDATE_DELTA 17
 
 struct stats_summary {
@@ -27,7 +28,15 @@ struct stats_summary {
 struct sample_record {
     double *prefetch_ns;
     double *update_ns;
-    int count;
+    int get_count;
+    int put_count;
+    double total_ns;
+    int total_ops;
+};
+
+struct workload_mix {
+    const char *label;
+    double write_ratio; // read ratio is (1 - write_ratio)
 };
 
 static void monotonic_now(struct timespec *ts)
@@ -66,7 +75,7 @@ static int parse_env_int(const char *name, int fallback)
 static int *parse_lz4_levels(int *out_count)
 {
     const char *env = getenv("TAIL_LATENCY_LZ4_LEVELS");
-    const char *source = (env && *env) ? env : "0,9,16";
+    const char *source = (env && *env) ? env : "0";
 
     char *copy = strdup(source);
     if (!copy) {
@@ -211,26 +220,60 @@ static void compute_stats(const double *samples, int count, struct stats_summary
 
 static void summarize_and_print(const char *label, const struct sample_record *samples)
 {
-    struct stats_summary get_stats;
-    struct stats_summary put_stats;
-
-    compute_stats(samples->prefetch_ns, samples->count, &get_stats);
-    compute_stats(samples->update_ns, samples->count, &put_stats);
-
     const double scale = 1e-3; // convert ns to µs for readability
-    printf("%s latency (µs)\n", label);
-    printf("  get : p50 %.3f  p90 %.3f  p99 %.3f  max %.3f  avg %.3f\n",
-           get_stats.p50_ns * scale,
-           get_stats.p90_ns * scale,
-           get_stats.p99_ns * scale,
-           get_stats.max_ns * scale,
-           get_stats.avg_ns * scale);
-    printf("  put : p50 %.3f  p90 %.3f  p99 %.3f  max %.3f  avg %.3f\n",
-           put_stats.p50_ns * scale,
-           put_stats.p90_ns * scale,
-           put_stats.p99_ns * scale,
-           put_stats.max_ns * scale,
-           put_stats.avg_ns * scale);
+    printf("%s\n", label);
+
+    if (samples->get_count > 0) {
+        struct stats_summary get_stats;
+        compute_stats(samples->prefetch_ns, samples->get_count, &get_stats);
+        printf("  get : p50 %.3f  p90 %.3f  p99 %.3f  max %.3f  avg %.3f\n",
+               get_stats.p50_ns * scale,
+               get_stats.p90_ns * scale,
+               get_stats.p99_ns * scale,
+               get_stats.max_ns * scale,
+               get_stats.avg_ns * scale);
+    } else {
+        printf("  get : n/a\n");
+    }
+
+    if (samples->put_count > 0) {
+        struct stats_summary put_stats;
+        compute_stats(samples->update_ns, samples->put_count, &put_stats);
+        printf("  put : p50 %.3f  p90 %.3f  p99 %.3f  max %.3f  avg %.3f\n",
+               put_stats.p50_ns * scale,
+               put_stats.p90_ns * scale,
+               put_stats.p99_ns * scale,
+               put_stats.max_ns * scale,
+               put_stats.avg_ns * scale);
+    } else {
+        printf("  put : n/a\n");
+    }
+
+    double seconds = samples->total_ns / 1e9;
+    if (samples->total_ops > 0 && seconds > 0.0) {
+        double throughput = samples->total_ops / seconds;
+        printf("  throughput: %.2f Mops/s (%d ops in %.2f ms)\n",
+               throughput / 1e6,
+               samples->total_ops,
+               seconds * 1e3);
+    } else {
+        printf("  throughput: n/a\n");
+    }
+}
+
+static void report_compression_stats(struct bplus_tree_compressed *tree)
+{
+    size_t total = 0;
+    size_t compressed = 0;
+    if (bplus_tree_compressed_calculate_stats(tree, &total, &compressed) == 0 && total > 0) {
+        double ratio = (double)compressed / (double)total;
+        printf("  compression: total %.2f KB  compressed %.2f KB  ratio %.3f\n",
+               total / 1024.0,
+               compressed / 1024.0,
+               ratio);
+    } else {
+        printf("  compression: unavailable\n");
+    }
 }
 
 static void warmup_tree(struct bplus_tree_compressed *tree,
@@ -251,16 +294,16 @@ static void warmup_tree(struct bplus_tree_compressed *tree,
     }
 }
 
-static void measure_latencies(struct bplus_tree_compressed *tree,
-                              const char *algo_label,
-                              const int *keys,
-                              const int *baseline_values,
-                              const int *updated_values,
-                              int sample_count,
-                              struct sample_record *out_samples,
-                              FILE *csv)
+static void measure_workload(struct bplus_tree_compressed *tree,
+                             const int *keys,
+                             const int *baseline_values,
+                             const int *updated_values,
+                             int sample_count,
+                             double write_ratio,
+                             struct sample_record *out_samples,
+                             FILE *csv,
+                             const char *csv_label)
 {
-    out_samples->count = sample_count;
     out_samples->prefetch_ns = malloc((size_t)sample_count * sizeof(double));
     out_samples->update_ns = malloc((size_t)sample_count * sizeof(double));
     if (!out_samples->prefetch_ns || !out_samples->update_ns) {
@@ -268,42 +311,71 @@ static void measure_latencies(struct bplus_tree_compressed *tree,
         exit(EXIT_FAILURE);
     }
 
-    for (int i = 0; i < sample_count; i++) {
-        struct timespec start, end;
+    out_samples->get_count = 0;
+    out_samples->put_count = 0;
+    out_samples->total_ops = 0;
+    out_samples->total_ns = 0.0;
 
-        monotonic_now(&start);
-        int value = bplus_tree_compressed_get(tree, (key_t)keys[i]);
-        monotonic_now(&end);
-        double prefetch_ns = elapsed_ns(&start, &end);
-        if (value != baseline_values[i]) {
-            fprintf(stderr, "[%s] prefetch mismatch: key=%d expected=%d got=%d\n",
-                    algo_label, keys[i], baseline_values[i], value);
-            exit(EXIT_FAILURE);
-        }
-
-        monotonic_now(&start);
-        int rc = bplus_tree_compressed_put(tree, (key_t)keys[i], updated_values[i]);
-        monotonic_now(&end);
-        double update_ns = elapsed_ns(&start, &end);
-        if (rc != 0) {
-            fprintf(stderr, "[%s] put failed for key=%d rc=%d\n", algo_label, keys[i], rc);
-            exit(EXIT_FAILURE);
-        }
-
-        out_samples->prefetch_ns[i] = prefetch_ns;
-        out_samples->update_ns[i] = update_ns;
-        int verify = bplus_tree_compressed_get(tree, (key_t)keys[i]);
-        if (verify != updated_values[i]) {
-            fprintf(stderr, "[%s] verification mismatch: key=%d expected=%d got=%d\n",
-                    algo_label, keys[i], updated_values[i], verify);
-            exit(EXIT_FAILURE);
-        }
-
-        if (csv) {
-            fprintf(csv, "%s,get,%d,%.0f\n", algo_label, i, prefetch_ns);
-            fprintf(csv, "%s,put,%d,%.0f\n", algo_label, i, update_ns);
+    int update_interval = INT_MAX;
+    if (write_ratio > 0.0) {
+        double inv = 1.0 / write_ratio;
+        update_interval = (int)llround(inv);
+        if (update_interval < 1) {
+            update_interval = 1;
         }
     }
+
+    struct timespec total_start, total_end;
+    monotonic_now(&total_start);
+
+    for (int i = 0; i < sample_count; i++) {
+        bool do_write = (write_ratio > 0.0) && ((i + 1) % update_interval == 0);
+        if (do_write) {
+            struct timespec start, end;
+            int value = updated_values[i];
+            monotonic_now(&start);
+            int rc = bplus_tree_compressed_put(tree, (key_t)keys[i], value);
+            monotonic_now(&end);
+            double put_ns = elapsed_ns(&start, &end);
+            if (rc != 0) {
+                fprintf(stderr, "put failed for key=%d rc=%d\n", keys[i], rc);
+                exit(EXIT_FAILURE);
+            }
+
+            int idx = out_samples->put_count++;
+            out_samples->update_ns[idx] = put_ns;
+            int verify = bplus_tree_compressed_get(tree, (key_t)keys[i]);
+            if (verify != value) {
+                fprintf(stderr, "verification mismatch: key=%d expected=%d got=%d\n",
+                        keys[i], value, verify);
+                exit(EXIT_FAILURE);
+            }
+            if (csv) {
+                fprintf(csv, "%s,put,%d,%.0f\n", csv_label, idx, put_ns);
+            }
+        } else {
+            struct timespec start, end;
+            monotonic_now(&start);
+            int value = bplus_tree_compressed_get(tree, (key_t)keys[i]);
+            monotonic_now(&end);
+            double get_ns = elapsed_ns(&start, &end);
+            if (value != baseline_values[i]) {
+                fprintf(stderr, "prefetch mismatch: key=%d expected=%d got=%d\n",
+                        keys[i], baseline_values[i], value);
+                exit(EXIT_FAILURE);
+            }
+
+            int idx = out_samples->get_count++;
+            out_samples->prefetch_ns[idx] = get_ns;
+            if (csv) {
+                fprintf(csv, "%s,get,%d,%.0f\n", csv_label, idx, get_ns);
+            }
+        }
+    }
+
+    monotonic_now(&total_end);
+    out_samples->total_ns = elapsed_ns(&total_start, &total_end);
+    out_samples->total_ops = out_samples->get_count + out_samples->put_count;
 }
 
 static void free_samples(struct sample_record *samples)
@@ -312,7 +384,10 @@ static void free_samples(struct sample_record *samples)
     free(samples->update_ns);
     samples->prefetch_ns = NULL;
     samples->update_ns = NULL;
-    samples->count = 0;
+    samples->get_count = 0;
+    samples->put_count = 0;
+    samples->total_ns = 0.0;
+    samples->total_ops = 0;
 }
 
 static void repopulate_baseline(struct bplus_tree_compressed *tree,
@@ -372,21 +447,118 @@ static void run_lz4_variant(int level,
         repopulate_baseline(tree, sample_keys, sample_baseline, sample_count);
     }
 
-    struct sample_record samples = {0};
-    char label[64];
-    format_lz4_label(level, label, sizeof(label));
+    struct workload_mix mixes[] = {
+        {"ReadOnly (100R/0W)", 0.0},
+        {"Mixed (80R/20W)", 0.2},
+    };
+    int mix_count = (int)(sizeof(mixes) / sizeof(mixes[0]));
 
-    measure_latencies(tree,
-                      label,
-                      sample_keys,
-                      sample_baseline,
-                      sample_updated,
-                      sample_count,
-                      &samples,
-                      csv);
+    char algo_label[64];
+    format_lz4_label(level, algo_label, sizeof(algo_label));
 
-    summarize_and_print(label, &samples);
-    free_samples(&samples);
+    for (int m = 0; m < mix_count; m++) {
+        repopulate_baseline(tree, sample_keys, sample_baseline, sample_count);
+
+        struct sample_record samples = {0};
+        char display_label[128];
+        char csv_label[128];
+        snprintf(display_label, sizeof(display_label), "%s %s", algo_label, mixes[m].label);
+        snprintf(csv_label, sizeof(csv_label), "%s_%s", algo_label, mixes[m].label);
+        for (char *p = csv_label; *p; ++p) {
+            if (*p == ' ' || *p == '/' || *p == '(' || *p == ')') {
+                *p = '_';
+            }
+        }
+
+        measure_workload(tree,
+                         sample_keys,
+                         sample_baseline,
+                         sample_updated,
+                         sample_count,
+                         mixes[m].write_ratio,
+                         &samples,
+                         csv,
+                         csv_label);
+
+        summarize_and_print(display_label, &samples);
+        report_compression_stats(tree);
+        puts("");
+        free_samples(&samples);
+    }
+
+    bplus_tree_compressed_deinit(tree);
+}
+
+static void run_qpl_workloads(int default_subpages,
+                              const int *keys,
+                              const int *values,
+                              int key_count,
+                              const int *sample_keys,
+                              const int *sample_baseline,
+                              const int *sample_updated,
+                              int sample_count,
+                              int warmup_iters,
+                              FILE *csv)
+{
+    struct compression_config qpl_cfg = bplus_tree_create_default_leaf_config(LEAF_TYPE_LZ4_HASHED);
+    qpl_cfg.algo = COMPRESS_QPL;
+    qpl_cfg.default_sub_pages = default_subpages;
+
+    struct bplus_tree_compressed *tree =
+        bplus_tree_compressed_init_with_config(16, 32, &qpl_cfg);
+    if (!tree) {
+        fprintf(stderr, "Failed to initialize QPL tree\n");
+        exit(EXIT_FAILURE);
+    }
+
+    populate_tree(tree, keys, values, key_count);
+
+    if (warmup_iters > 0) {
+        warmup_tree(tree, sample_keys, sample_baseline, sample_updated, warmup_iters);
+        repopulate_baseline(tree, sample_keys, sample_baseline, sample_count);
+    }
+
+    struct workload_mix mixes[] = {
+        {"ReadOnly (100R/0W)", 0.0},
+        {"Mixed (80R/20W)", 0.2},
+    };
+    int mix_count = (int)(sizeof(mixes) / sizeof(mixes[0]));
+
+    const char *algo_label = "QPL";
+
+    for (int m = 0; m < mix_count; m++) {
+        repopulate_baseline(tree, sample_keys, sample_baseline, sample_count);
+
+        struct sample_record samples = {0};
+        char display_label[128];
+        char csv_label[128];
+        snprintf(display_label, sizeof(display_label), "%s %s", algo_label, mixes[m].label);
+        snprintf(csv_label, sizeof(csv_label), "%s_%s", algo_label, mixes[m].label);
+        for (char *p = csv_label; *p; ++p) {
+            if (*p == ' ' || *p == '/' || *p == '(' || *p == ')') {
+                *p = '_';
+            }
+        }
+
+        measure_workload(tree,
+                         sample_keys,
+                         sample_baseline,
+                         sample_updated,
+                         sample_count,
+                         mixes[m].write_ratio,
+                         &samples,
+                         csv,
+                         csv_label);
+
+        summarize_and_print(display_label, &samples);
+        if (tree->qpl_job_ptr == NULL) {
+            printf("  warning: QPL job not initialized; falling back to LZ4 path\n");
+        }
+        report_compression_stats(tree);
+        puts("");
+        free_samples(&samples);
+    }
+
     bplus_tree_compressed_deinit(tree);
 }
 int main(void)
@@ -395,6 +567,8 @@ int main(void)
     int sample_count = parse_env_int("TAIL_LATENCY_SAMPLE_COUNT", DEFAULT_SAMPLE_COUNT);
     int warmup_count = parse_env_int("TAIL_LATENCY_WARMUP", DEFAULT_WARMUP_COUNT);
     int default_subpages = parse_env_int("TAIL_LATENCY_SUBPAGES", DEFAULT_NUM_SUBPAGES);
+
+    srand(42);
 
     if (sample_count > key_count) {
         fprintf(stderr, "sample_count (%d) cannot exceed key_count (%d)\n",
@@ -467,42 +641,21 @@ int main(void)
 
     free(lz4_levels);
 
-    struct compression_config qpl_cfg = bplus_tree_create_default_leaf_config(LEAF_TYPE_LZ4_HASHED);
-    qpl_cfg.algo = COMPRESS_QPL;
-    qpl_cfg.default_sub_pages = default_subpages;
-
-    struct bplus_tree_compressed *qpl_tree =
-        bplus_tree_compressed_init_with_config(16, 32, &qpl_cfg);
-    if (!qpl_tree) {
-        fprintf(stderr, "Failed to initialize QPL tree\n");
-        exit(EXIT_FAILURE);
-    }
-
-    populate_tree(qpl_tree, keys, values, key_count);
-
-    if (warmup_iters > 0) {
-        warmup_tree(qpl_tree, sample_keys, sample_baseline, sample_updated, warmup_iters);
-        repopulate_baseline(qpl_tree, sample_keys, sample_baseline, sample_count);
-    }
-
-    struct sample_record qpl_samples = {0};
-
-    measure_latencies(qpl_tree, "QPL",
-                      sample_keys, sample_baseline, sample_updated,
-                      sample_count, &qpl_samples, csv);
+    run_qpl_workloads(default_subpages,
+                      keys,
+                      values,
+                      key_count,
+                      sample_keys,
+                      sample_baseline,
+                      sample_updated,
+                      sample_count,
+                      warmup_iters,
+                      csv);
 
     if (csv) {
         fclose(csv);
         printf("CSV written to %s\n", csv_path);
     }
-    summarize_and_print("QPL", &qpl_samples);
-
-    if (qpl_tree->qpl_job_ptr == NULL) {
-        printf("Note: QPL initialization failed; results reflect LZ4 fallback.\n");
-    }
-
-    free_samples(&qpl_samples);
-    bplus_tree_compressed_deinit(qpl_tree);
     free(sample_keys);
     free(sample_baseline);
     free(sample_updated);

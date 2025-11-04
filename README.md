@@ -14,13 +14,22 @@ Paper: Xie, Ma, Zhong, Chen, Zhang. “ZipCache: A DRAM/SSD Cache with Built‑i
 
 ## Quick Start
 
-- Build
-  - `mkdir build && cd build && cmake .. && make -j$(nproc)`
-- DRAM tier benchmark
-  - `cd DRAM-tier/build && make && ./bin/bpt_compressed_synthetic_test`
+All active development and tests build out of the `DRAM-tier` subdirectory. The
+top-level `build` folder is kept only for legacy binaries; please work inside
+`DRAM-tier` instead.
 
-- Smoke tests
-  - `./bin/bpt_compressed_lz4_smoke` and `./bin/bpt_compressed_qpl_smoke`
+```bash
+cd DRAM-tier
+cmake -S . -B build
+cmake --build build -j$(nproc)
+```
+
+Key executables live in `DRAM-tier/build/bin/`. Examples:
+
+- `tail_latency_compare` – synthetic latency mixes (read-only, 80/20 read/write)
+- `dcperf_workload_benchmark` – TaoBench-inspired size distribution and mix
+- `bpt_compressed_lz4_smoke`, `bpt_compressed_qpl_smoke` – basic smoke tests
+- `bpt_compressed_synthetic_test` – legacy synthetic benchmark
 
 
 ## Key Paths

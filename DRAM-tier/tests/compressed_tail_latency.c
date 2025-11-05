@@ -11,10 +11,10 @@
 
 #include "bplustree_compressed.h"
 
-#define DEFAULT_KEY_COUNT 8192000
-#define DEFAULT_SAMPLE_COUNT 40960
+#define DEFAULT_KEY_COUNT 8192*16
+#define DEFAULT_SAMPLE_COUNT 4096
 #define DEFAULT_NUM_SUBPAGES 16
-#define DEFAULT_WARMUP_COUNT 2560000
+#define DEFAULT_WARMUP_COUNT 25600
 #define UPDATE_DELTA 17
 
 struct stats_summary {

@@ -64,3 +64,7 @@ target_link_libraries(tail_latency_compare ${LIB_BPLUSTREE_COMPRESSED_NAME} m)
 
 add_executable(dcperf_workload_benchmark compressed_dcperf_workload.c)
 target_link_libraries(dcperf_workload_benchmark ${LIB_BPLUSTREE_COMPRESSED_NAME} m)
+
+# Micro-benchmark LZ4 vs QPL on fixed 4KB blocks
+add_executable(qpl_lz4_block_bench qpl_lz4_block_bench.c)
+target_link_libraries(qpl_lz4_block_bench ${LIB_BPLUSTREE_COMPRESSED_NAME})

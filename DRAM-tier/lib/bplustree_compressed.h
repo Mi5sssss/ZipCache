@@ -19,7 +19,8 @@
 
 // Legacy constants from btree.h
 #define KEY_SIZE 8
-#define LANDING_BUFFER_BYTES 512
+#define COMPRESSED_VALUE_BYTES 64
+#define LANDING_BUFFER_BYTES 1024
 #define TOTAL_SUBPAGES_BYTES 4096
 
 
@@ -153,6 +154,16 @@ void bplus_tree_compressed_set_debug(struct bplus_tree_compressed *ct_tree, int 
 int bplus_tree_compressed_put(struct bplus_tree_compressed *ct_tree, key_t key, int data);
 
 /**
+ * Insert/update with an explicit payload stored inline in the leaf (up to COMPRESSED_VALUE_BYTES).
+ * stored_value is returned by bplus_tree_compressed_get for compatibility.
+ */
+int bplus_tree_compressed_put_with_payload(struct bplus_tree_compressed *ct_tree,
+                                           key_t key,
+                                           const uint8_t *payload,
+                                           size_t payload_len,
+                                           int stored_value);
+
+/**
  * Thread-safe delete operation with compression
  * @param ct_tree Pointer to compressed B+Tree
  * @param key The key to remove
@@ -225,6 +236,11 @@ struct compression_config bplus_tree_create_default_leaf_config(leaf_layout_t de
  * @param value The value to insert
  * @return 0 on success, -1 if leaf needs splitting
  */
-int insert_into_leaf(struct bplus_tree_compressed *ct_tree, struct simple_leaf_node *leaf, key_t key, value_t value);
+int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
+                     struct simple_leaf_node *leaf,
+                     key_t key,
+                     int stored_value,
+                     const uint8_t *payload,
+                     size_t payload_len);
 
 #endif /* _BPLUS_TREE_COMPRESSED_H */

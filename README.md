@@ -36,9 +36,9 @@ sh ../tests/run_kv_bench.sh
 sh ../tests/run_tail_latency_sizes.sh
 ```
 
-### Recent software-path results (Silesia)
+### Software-path results (Silesia)
 
-KV microbench (`run_kv_bench.sh`, occ=50%, blocks=4096, QPL=software):
+KV microbench (`run_kv_bench.sh`, occ=50%, blocks=4096, QPL=software): simulates leaf-shaped key/value payloads only (no tree traversal), to isolate codec throughput/latency. It performs a fresh compress/decompress per block (no landing buffer or other amortization), so absolute numbers can be lower than end-to-end trees where some work is avoided.
 
 | Block | LZ4 comp p50/p90/p95/p99 (µs) | LZ4 decomp p50/p90/p95/p99 (µs) | LZ4 ratio | LZ4 GB/s (comp/decomp) | QPL comp p50/p90/p95/p99 (µs) | QPL decomp p50/p90/p95/p99 (µs) | QPL ratio | QPL GB/s (comp/decomp) |
 |-------|-------------------------------|----------------------------------|-----------|------------------------|--------------------------------|----------------------------------|-----------|-------------------------|
@@ -46,7 +46,7 @@ KV microbench (`run_kv_bench.sh`, occ=50%, blocks=4096, QPL=software):
 | 8KB   | 13.57 / 18.24 / 19.53 / 22.72 | 2.83 / 3.17 / 3.28 / 3.73        | 3.21x     | ~560 / 2858            | 31.38 / 38.48 / 40.54 / 43.79  | 13.01 / 16.44 / 17.45 / 19.30    | 3.11x     | ~251 / 607              |
 | 16KB  | 26.87 / 31.33 / 32.70 / 36.83 | 5.72 / 6.21 / 6.38 / 6.97        | 3.26x     | ~606 / 2862            | 62.60 / 73.89 / 77.38 / 83.23  | 25.14 / 30.44 / 32.49 / 35.90    | 3.06x     | ~254 / 628              |
 
-Tree `tail_latency_compare` (`run_tail_latency_sizes.sh`, read-only p50, throughput Mops/s):
+Tree end-to-end `tail_latency_compare` (`run_tail_latency_sizes.sh`, read-only p50, throughput Mops/s): includes tree traversal/buffering overhead in addition to codec cost.
 
 | Leaf size | LZ4 p50 (µs) | LZ4 throughput (Mops/s) | LZ4 ratio | QPL p50 (µs) | QPL throughput (Mops/s) | QPL ratio |
 |-----------|--------------|-------------------------|-----------|--------------|-------------------------|-----------|

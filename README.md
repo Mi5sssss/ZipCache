@@ -30,10 +30,10 @@ Quick one-click runs (after building `DRAM-tier/build`):
 
 ```bash
 # Microbench across 4K/8K/16K, software QPL, Silesia payload
-sh ../tests/run_kv_bench.sh
+sh ./tests/run_kv_bench.sh
 
 # Tree benchmark across 4K/8K/16K leaf sizes (rebuilds per size, restores header)
-sh ../tests/run_tail_latency_sizes.sh
+sh ./tests/run_tail_latency_sizes.sh
 ```
 
 ### Software-path results (Silesia)

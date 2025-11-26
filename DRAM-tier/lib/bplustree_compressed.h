@@ -15,12 +15,12 @@
 
 // 4KB leaf node size for optimal compression
 #define COMPRESSED_LEAF_SIZE 4096
-#define MAX_COMPRESSED_SIZE 8192  // Fixed size for LZ4 compression buffer
+#define MAX_COMPRESSED_SIZE 4096*2  // Fixed size for LZ4 compression buffer
 
 // Legacy constants from btree.h
 #define KEY_SIZE 8
 #define COMPRESSED_VALUE_BYTES 64
-#define LANDING_BUFFER_BYTES 1024
+#define LANDING_BUFFER_BYTES 512
 #define TOTAL_SUBPAGES_BYTES 4096
 
 
@@ -100,10 +100,16 @@ struct bplus_tree_compressed {
     struct simple_compression_config simple_config;  // Simplified dual-algorithm configuration
     int is_simple_mode;                     // Flag: 1 for simple API, 0 for legacy API
 
-    // QPL support
-    qpl_job *qpl_job_ptr;                  // QPL job for compression operations
-    uint8_t *qpl_job_buffer;               // QPL job buffer
-    pthread_mutex_t qpl_lock;              // Mutex for QPL operations
+    // QPL job pool
+    qpl_job **qpl_job_pool;                // Array of job pointers
+    uint8_t **qpl_job_buffers;             // Backing buffers for jobs
+    int qpl_pool_size;                     // Number of jobs in pool
+
+    // Pool management
+    int *qpl_job_free_list;                // Stack of free job indices
+    int qpl_free_count;                    // Number of free jobs
+    pthread_mutex_t qpl_pool_lock;         // Protects pool structures
+    pthread_cond_t qpl_pool_cond;          // Signals job availability
 
     // Global compression statistics
     size_t total_uncompressed_size;         // Total uncompressed size

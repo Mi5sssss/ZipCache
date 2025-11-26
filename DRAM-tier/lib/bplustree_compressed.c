@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <limits.h>
 #include <time.h>
 #include <unistd.h>
 #include "bplustree_compressed.h"
@@ -22,6 +23,8 @@
 static struct bplus_leaf *find_leaf_for_key(struct bplus_tree *tree, key_t key);
 void cleanup_qpl(struct bplus_tree_compressed *ct_tree);
 int init_qpl(struct bplus_tree_compressed *ct_tree);
+static qpl_job *acquire_qpl_job(struct bplus_tree_compressed *ct_tree, int *job_index_out);
+static void release_qpl_job(struct bplus_tree_compressed *ct_tree, int job_index);
 static int hash_key_to_sub_page(key_t key, int num_sub_pages);
 static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_tree,
                                               key_t key,
@@ -164,6 +167,48 @@ static int positive_mod_i32(key_t value, int mod)
     return rem;
 }
 
+static qpl_job *acquire_qpl_job(struct bplus_tree_compressed *ct_tree, int *job_index_out)
+{
+    if (!ct_tree || ct_tree->qpl_pool_size <= 0 || !ct_tree->qpl_job_pool || !ct_tree->qpl_job_free_list) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&ct_tree->qpl_pool_lock);
+    while (ct_tree->qpl_free_count == 0 && ct_tree->qpl_pool_size > 0) {
+        pthread_cond_wait(&ct_tree->qpl_pool_cond, &ct_tree->qpl_pool_lock);
+    }
+
+    if (ct_tree->qpl_pool_size <= 0 || ct_tree->qpl_free_count <= 0) {
+        pthread_mutex_unlock(&ct_tree->qpl_pool_lock);
+        return NULL;
+    }
+
+    ct_tree->qpl_free_count--;
+    int job_index = ct_tree->qpl_job_free_list[ct_tree->qpl_free_count];
+    qpl_job *job = ct_tree->qpl_job_pool[job_index];
+    pthread_mutex_unlock(&ct_tree->qpl_pool_lock);
+
+    if (job_index_out) {
+        *job_index_out = job_index;
+    }
+    return job;
+}
+
+static void release_qpl_job(struct bplus_tree_compressed *ct_tree, int job_index)
+{
+    if (!ct_tree || job_index < 0 || job_index >= ct_tree->qpl_pool_size) {
+        return;
+    }
+
+    pthread_mutex_lock(&ct_tree->qpl_pool_lock);
+    if (ct_tree->qpl_free_count < ct_tree->qpl_pool_size) {
+        ct_tree->qpl_job_free_list[ct_tree->qpl_free_count] = job_index;
+        ct_tree->qpl_free_count++;
+        pthread_cond_signal(&ct_tree->qpl_pool_cond);
+    }
+    pthread_mutex_unlock(&ct_tree->qpl_pool_lock);
+}
+
 static bool subpage_needed_for_range(key_t min_key, key_t max_key, int bucket, int num_subpages)
 {
     if (num_subpages <= 0) {
@@ -198,21 +243,23 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
                             uint8_t *dst,
                             uint32_t dst_capacity)
 {
-    if (leaf->compression_algo == COMPRESS_QPL && ct_tree->qpl_job_ptr) {
-        pthread_mutex_lock(&ct_tree->qpl_lock);
-        qpl_job *job = ct_tree->qpl_job_ptr;
-        job->op = qpl_op_compress;
-        job->next_in_ptr = (uint8_t *)src;
-        job->available_in = src_size;
-        job->next_out_ptr = dst;
-        job->available_out = dst_capacity;
-        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
-        job->level = qpl_default_level;
-        qpl_status status = qpl_execute_job(job);
-        uint32_t produced = job->total_out;
-        pthread_mutex_unlock(&ct_tree->qpl_lock);
-        if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
-            return (int)produced;
+    if (leaf->compression_algo == COMPRESS_QPL && ct_tree->qpl_pool_size > 0) {
+        int job_index = -1;
+        qpl_job *job = acquire_qpl_job(ct_tree, &job_index);
+        if (job) {
+            job->op = qpl_op_compress;
+            job->next_in_ptr = (uint8_t *)src;
+            job->available_in = src_size;
+            job->next_out_ptr = dst;
+            job->available_out = dst_capacity;
+            job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+            job->level = qpl_default_level;
+            qpl_status status = qpl_execute_job(job);
+            uint32_t produced = job->total_out;
+            release_qpl_job(ct_tree, job_index);
+            if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
+                return (int)produced;
+            }
         }
     }
 
@@ -252,20 +299,22 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
                               uint8_t *dst,
                               uint32_t dst_capacity)
 {
-    if (leaf->compression_algo == COMPRESS_QPL && ct_tree->qpl_job_ptr) {
-        pthread_mutex_lock(&ct_tree->qpl_lock);
-        qpl_job *job = ct_tree->qpl_job_ptr;
-        job->op = qpl_op_decompress;
-        job->next_in_ptr = (uint8_t *)src;
-        job->available_in = src_size;
-        job->next_out_ptr = dst;
-        job->available_out = dst_capacity;
-        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
-        qpl_status status = qpl_execute_job(job);
-        uint32_t produced = job->total_out;
-        pthread_mutex_unlock(&ct_tree->qpl_lock);
-        if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
-            return (int)produced;
+    if (leaf->compression_algo == COMPRESS_QPL && ct_tree->qpl_pool_size > 0) {
+        int job_index = -1;
+        qpl_job *job = acquire_qpl_job(ct_tree, &job_index);
+        if (job) {
+            job->op = qpl_op_decompress;
+            job->next_in_ptr = (uint8_t *)src;
+            job->available_in = src_size;
+            job->next_out_ptr = dst;
+            job->available_out = dst_capacity;
+            job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+            qpl_status status = qpl_execute_job(job);
+            uint32_t produced = job->total_out;
+            release_qpl_job(ct_tree, job_index);
+            if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
+                return (int)produced;
+            }
         }
     }
 
@@ -2248,37 +2297,127 @@ void bplus_tree_compressed_set_debug(struct bplus_tree_compressed *ct_tree, int 
 
 int init_qpl(struct bplus_tree_compressed *ct_tree)
 {
-    if (ct_tree->qpl_job_ptr) return 0; // Already initialized
+    if (ct_tree->qpl_pool_size > 0) {
+        return 0; // Already initialized
+    }
 
-    pthread_mutex_init(&ct_tree->qpl_lock, NULL);
-    
-    uint32_t job_size;
+    uint32_t job_size = 0;
     qpl_status status = qpl_get_job_size(qpl_path_auto, &job_size);
-    if (status != QPL_STS_OK) return -1;
-    
-    ct_tree->qpl_job_buffer = malloc(job_size);
-    if (!ct_tree->qpl_job_buffer) return -1;
-    
-    ct_tree->qpl_job_ptr = (qpl_job*)ct_tree->qpl_job_buffer;
-    status = qpl_init_job(qpl_path_auto, ct_tree->qpl_job_ptr);
-    if (status != QPL_STS_OK) {
-        free(ct_tree->qpl_job_buffer);
-        ct_tree->qpl_job_buffer = NULL;
+    if (status != QPL_STS_OK || job_size == 0) {
         return -1;
     }
-    
+
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    int pool_size = (cores > 0 && cores < INT_MAX) ? (int)cores : 1;
+    if (pool_size < 1) {
+        pool_size = 1;
+    }
+    const int max_pool = 16;
+    if (pool_size > max_pool) {
+        pool_size = max_pool;
+    }
+
+    qpl_job **jobs = calloc((size_t)pool_size, sizeof(qpl_job *));
+    uint8_t **buffers = calloc((size_t)pool_size, sizeof(uint8_t *));
+    int *free_list = calloc((size_t)pool_size, sizeof(int));
+    if (!jobs || !buffers || !free_list) {
+        free(jobs);
+        free(buffers);
+        free(free_list);
+        return -1;
+    }
+
+    int lock_initialized = 0;
+    int cond_initialized = 0;
+    if (pthread_mutex_init(&ct_tree->qpl_pool_lock, NULL) != 0) {
+        goto fail;
+    }
+    lock_initialized = 1;
+    if (pthread_cond_init(&ct_tree->qpl_pool_cond, NULL) != 0) {
+        goto fail;
+    }
+    cond_initialized = 1;
+
+    int initialized_jobs = 0;
+    for (int i = 0; i < pool_size; i++) {
+        buffers[i] = malloc(job_size);
+        if (!buffers[i]) {
+            goto fail;
+        }
+        jobs[i] = (qpl_job *)buffers[i];
+        status = qpl_init_job(qpl_path_auto, jobs[i]);
+        if (status != QPL_STS_OK) {
+            goto fail;
+        }
+        free_list[i] = i;
+        initialized_jobs++;
+    }
+
+    ct_tree->qpl_job_pool = jobs;
+    ct_tree->qpl_job_buffers = buffers;
+    ct_tree->qpl_job_free_list = free_list;
+    ct_tree->qpl_pool_size = pool_size;
+    ct_tree->qpl_free_count = pool_size;
     return 0;
+
+fail:
+    for (int i = 0; i < pool_size; i++) {
+        if (jobs && jobs[i] && i < initialized_jobs) {
+            qpl_fini_job(jobs[i]);
+        }
+        if (buffers && buffers[i]) {
+            free(buffers[i]);
+        }
+    }
+    free(jobs);
+    free(buffers);
+    free(free_list);
+    if (cond_initialized) {
+        pthread_cond_destroy(&ct_tree->qpl_pool_cond);
+    }
+    if (lock_initialized) {
+        pthread_mutex_destroy(&ct_tree->qpl_pool_lock);
+    }
+    return -1;
 }
 
 void cleanup_qpl(struct bplus_tree_compressed *ct_tree)
 {
-    if (ct_tree->qpl_job_ptr) {
-        qpl_fini_job(ct_tree->qpl_job_ptr);
-        ct_tree->qpl_job_ptr = NULL;
+    if (ct_tree == NULL) {
+        return;
     }
-    if (ct_tree->qpl_job_buffer) {
-        free(ct_tree->qpl_job_buffer);
-        ct_tree->qpl_job_buffer = NULL;
+    if (ct_tree->qpl_pool_size <= 0 &&
+        !ct_tree->qpl_job_pool &&
+        !ct_tree->qpl_job_buffers &&
+        !ct_tree->qpl_job_free_list) {
+        return;
     }
-    pthread_mutex_destroy(&ct_tree->qpl_lock);
+
+    pthread_mutex_lock(&ct_tree->qpl_pool_lock);
+    int pool_size = ct_tree->qpl_pool_size;
+    ct_tree->qpl_pool_size = 0;
+    ct_tree->qpl_free_count = 0;
+    pthread_cond_broadcast(&ct_tree->qpl_pool_cond);
+    pthread_mutex_unlock(&ct_tree->qpl_pool_lock);
+
+    if (ct_tree->qpl_job_pool && ct_tree->qpl_job_buffers) {
+        for (int i = 0; i < pool_size; i++) {
+            if (ct_tree->qpl_job_pool[i]) {
+                qpl_fini_job(ct_tree->qpl_job_pool[i]);
+            }
+            if (ct_tree->qpl_job_buffers[i]) {
+                free(ct_tree->qpl_job_buffers[i]);
+            }
+        }
+    }
+
+    free(ct_tree->qpl_job_pool);
+    free(ct_tree->qpl_job_buffers);
+    free(ct_tree->qpl_job_free_list);
+    ct_tree->qpl_job_pool = NULL;
+    ct_tree->qpl_job_buffers = NULL;
+    ct_tree->qpl_job_free_list = NULL;
+
+    pthread_cond_destroy(&ct_tree->qpl_pool_cond);
+    pthread_mutex_destroy(&ct_tree->qpl_pool_lock);
 }

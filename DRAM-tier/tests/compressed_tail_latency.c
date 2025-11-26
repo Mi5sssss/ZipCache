@@ -723,20 +723,42 @@ static int decompress_bucket(struct bplus_tree_compressed *tree,
                              uint8_t *dst,
                              int dst_capacity)
 {
-    if (leaf->compression_algo == COMPRESS_QPL && tree->qpl_job_ptr) {
-        pthread_mutex_lock(&tree->qpl_lock);
-        qpl_job *job = tree->qpl_job_ptr;
-        job->op = qpl_op_decompress;
-        job->next_in_ptr = (uint8_t *)leaf->compressed_data + entry->offset;
-        job->available_in = entry->length;
-        job->next_out_ptr = dst;
-        job->available_out = (uint32_t)dst_capacity;
-        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
-        qpl_status status = qpl_execute_job(job);
-        uint32_t produced = job->total_out;
-        pthread_mutex_unlock(&tree->qpl_lock);
-        if (status == QPL_STS_OK && produced > 0 && produced <= (uint32_t)dst_capacity) {
-            return (int)produced;
+    if (leaf->compression_algo == COMPRESS_QPL && tree->qpl_pool_size > 0) {
+        qpl_job *job = NULL;
+        int job_index = -1;
+
+        pthread_mutex_lock(&tree->qpl_pool_lock);
+        while (tree->qpl_free_count == 0 && tree->qpl_pool_size > 0) {
+            pthread_cond_wait(&tree->qpl_pool_cond, &tree->qpl_pool_lock);
+        }
+        if (tree->qpl_free_count > 0) {
+            tree->qpl_free_count--;
+            job_index = tree->qpl_job_free_list[tree->qpl_free_count];
+            job = tree->qpl_job_pool[job_index];
+        }
+        pthread_mutex_unlock(&tree->qpl_pool_lock);
+
+        if (job) {
+            job->op = qpl_op_decompress;
+            job->next_in_ptr = (uint8_t *)leaf->compressed_data + entry->offset;
+            job->available_in = entry->length;
+            job->next_out_ptr = dst;
+            job->available_out = (uint32_t)dst_capacity;
+            job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+            qpl_status status = qpl_execute_job(job);
+            uint32_t produced = job->total_out;
+
+            pthread_mutex_lock(&tree->qpl_pool_lock);
+            if (job_index >= 0 && tree->qpl_free_count < tree->qpl_pool_size) {
+                tree->qpl_job_free_list[tree->qpl_free_count] = job_index;
+                tree->qpl_free_count++;
+                pthread_cond_signal(&tree->qpl_pool_cond);
+            }
+            pthread_mutex_unlock(&tree->qpl_pool_lock);
+
+            if (status == QPL_STS_OK && produced > 0 && produced <= (uint32_t)dst_capacity) {
+                return (int)produced;
+            }
         }
     }
 
@@ -1086,8 +1108,8 @@ static void run_qpl_workloads(int default_subpages,
                          dataset);
 
         summarize_and_print(display_label, &samples);
-        if (tree->qpl_job_ptr == NULL) {
-            printf("  warning: QPL job not initialized; falling back to LZ4 path\n");
+        if (tree->qpl_pool_size <= 0) {
+            printf("  warning: QPL job pool not initialized; falling back to LZ4 path\n");
         }
         report_compression_stats(tree);
         puts("");

@@ -68,3 +68,11 @@ target_link_libraries(dcperf_workload_benchmark ${LIB_BPLUSTREE_COMPRESSED_NAME}
 # Micro-benchmark LZ4 vs QPL on fixed 4KB blocks
 add_executable(qpl_lz4_block_bench qpl_lz4_block_bench.c)
 target_link_libraries(qpl_lz4_block_bench ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Simple block-size sweep benchmark (LZ4 vs QPL, Silesia payload)
+add_executable(qpl_lz4_block_sizes qpl_lz4_block_sizes.c)
+target_link_libraries(qpl_lz4_block_sizes ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Micro-benchmark LZ4 vs QPL on kv-pair shaped 8KB pages (tree-like layout)
+add_executable(qpl_lz4_kv_bench qpl_lz4_kv_bench.c)
+target_link_libraries(qpl_lz4_kv_bench ${LIB_BPLUSTREE_COMPRESSED_NAME})

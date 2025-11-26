@@ -13,8 +13,8 @@
 #include <lz4.h>
 #include <qpl/qpl.h>
 
-#define BLOCK_SIZE 256
-#define DEFAULT_BLOCKS 1024
+#define BLOCK_SIZE 8192
+#define DEFAULT_BLOCKS 8192
 #define MAX_COMPRESSED (BLOCK_SIZE * 2)
 
 static void die(const char *msg)

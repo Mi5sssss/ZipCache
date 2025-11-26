@@ -13,7 +13,7 @@
 #include <lz4.h>
 #include <qpl/qpl.h>
 
-#define BLOCK_SIZE 4096
+#define BLOCK_SIZE 256
 #define DEFAULT_BLOCKS 1024
 #define MAX_COMPRESSED (BLOCK_SIZE * 2)
 
@@ -102,26 +102,46 @@ static int load_samba_blocks(uint8_t **out_buf, int blocks, int *out_blocks_used
         return -1;
     }
 
-    size_t need_bytes = (size_t)blocks * BLOCK_SIZE;
-    uint8_t *buffer = malloc(need_bytes);
+    size_t alloc_bytes = (size_t)blocks * BLOCK_SIZE;
+    if (alloc_bytes < 64 * 1024) {
+        alloc_bytes = 64 * 1024;
+    }
+    uint8_t *buffer = malloc(alloc_bytes);
     if (!buffer) {
         pclose(pipe);
         return -1;
     }
 
     size_t total = 0;
-    while (total < need_bytes) {
-        size_t got = fread(buffer + total, 1, need_bytes - total, pipe);
+    while (1) {
+        size_t avail = alloc_bytes - total;
+        if (avail == 0) {
+            size_t new_size = alloc_bytes * 2;
+            uint8_t *tmp = realloc(buffer, new_size);
+            if (!tmp) {
+                free(buffer);
+                pclose(pipe);
+                return -1;
+            }
+            buffer = tmp;
+            alloc_bytes = new_size;
+            avail = alloc_bytes - total;
+        }
+        size_t got = fread(buffer + total, 1, avail, pipe);
+        total += got;
         if (got == 0) {
-            if (feof(pipe) || ferror(pipe)) {
+            if (feof(pipe)) {
                 break;
             }
+            if (ferror(pipe)) {
+                free(buffer);
+                pclose(pipe);
+                return -1;
+            }
         }
-        total += got;
     }
     int status = pclose(pipe);
-    /* tolerate SIGPIPE or non-zero if we already have data */
-    if (total == 0 || status == -1) {
+    if (total == 0) {
         free(buffer);
         return -1;
     }
@@ -130,6 +150,11 @@ static int load_samba_blocks(uint8_t **out_buf, int blocks, int *out_blocks_used
     if (available_blocks <= 0) {
         free(buffer);
         return -1;
+    }
+
+    if (status != 0) {
+        fprintf(stderr, "Warning: unzip returned status %d after reading %zu bytes from %s\n",
+                status, total, resolved);
     }
 
     *out_blocks_used = available_blocks < blocks ? available_blocks : blocks;
@@ -286,7 +311,7 @@ static void bench_qpl(const uint8_t *src_blocks, int blocks, int **out_sizes)
 int main(void)
 {
     int blocks = parse_env_int("BLOCK_BENCH_COUNT", DEFAULT_BLOCKS);
-    int use_samba = parse_env_int("BLOCK_BENCH_USE_SILESIA", 0);
+    int use_samba = parse_env_int("BLOCK_BENCH_USE_SILESIA", 1);
 
     uint8_t *blocks_buf = NULL;
     int usable_blocks = blocks;

@@ -76,3 +76,7 @@ target_link_libraries(qpl_lz4_block_sizes ${LIB_BPLUSTREE_COMPRESSED_NAME})
 # Micro-benchmark LZ4 vs QPL on kv-pair shaped 8KB pages (tree-like layout)
 add_executable(qpl_lz4_kv_bench qpl_lz4_kv_bench.c)
 target_link_libraries(qpl_lz4_kv_bench ${LIB_BPLUSTREE_COMPRESSED_NAME})
+
+# Multi-threaded benchmark (C++)
+add_executable(qpl_lz4_kv_bench_mt qpl_lz4_kv_bench_mt.cpp)
+target_link_libraries(qpl_lz4_kv_bench_mt ${LIB_BPLUSTREE_COMPRESSED_NAME} Threads::Threads)

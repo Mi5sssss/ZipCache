@@ -2,6 +2,9 @@
 
 ## Quick Start
 
+> [!NOTE]
+> If you want to use the Silesia corpus for benchmarks, please run `git submodule update --init SilesiaCorpus` first.
+
 All active development and tests build out of the `DRAM-tier` subdirectory. The
 top-level `build` folder is kept only for legacy binaries; please work inside
 `DRAM-tier` instead.
@@ -34,6 +37,11 @@ sh ./tests/run_kv_bench.sh
 
 # Tree benchmark across 4K/8K/16K leaf sizes (rebuilds per size, restores header)
 sh ./tests/run_tail_latency_sizes.sh
+
+# Multi-threaded Throughput Benchmark (C++)
+# Measures scalability of QPL vs LZ4.
+# Set KV_THREADS to your CPU core count (e.g., 32).
+KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_mt
 ```
 
 ### Software-path results (Silesia)

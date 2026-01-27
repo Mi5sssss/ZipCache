@@ -84,3 +84,7 @@ target_link_libraries(qpl_lz4_kv_bench_mt ${LIB_BPLUSTREE_COMPRESSED_NAME} Threa
 # Async batch benchmark (C++)
 add_executable(qpl_lz4_kv_bench_async qpl_lz4_kv_bench_async.cpp)
 target_link_libraries(qpl_lz4_kv_bench_async ${LIB_BPLUSTREE_COMPRESSED_NAME} Threads::Threads)
+
+# Mixed workload benchmark (read + write + compaction)
+add_executable(qpl_lz4_mixed_workload qpl_lz4_mixed_workload.cpp)
+target_link_libraries(qpl_lz4_mixed_workload ${LIB_BPLUSTREE_COMPRESSED_NAME} Threads::Threads)

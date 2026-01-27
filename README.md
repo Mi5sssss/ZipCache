@@ -24,39 +24,85 @@ Key executables live in `DRAM-tier/build/bin/`. Examples:
 
 ## Benchmarks
 
+> [!NOTE]
+> All benchmarks use the Silesia corpus by default. Run `git submodule update --init SilesiaCorpus` first.
+
 ### Quick Start
+
 ```bash
-# Single-threaded codec benchmark
+# Build benchmarks
+cd DRAM-tier
+cmake --build build -j$(nproc)
+
+# Run basic codec benchmark
 sh ./tests/run_kv_bench.sh
 
-# Multi-threaded synchronous (low latency)
-KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_mt
-
-# Multi-threaded asynchronous (high throughput, optimized for IAA hardware)
-KV_THREADS=8 KV_BATCH_SIZE=8 ./build/bin/qpl_lz4_kv_bench_async
-
-# Dynamic Huffman mode (+25% compression ratio)
-KV_QPL_MODE=dynamic KV_THREADS=8 ./build/bin/qpl_lz4_kv_bench_async
+# Run multi-threaded benchmarks
+KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_mt          # Sync
+KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_async       # Async
+KV_THREADS=32 ./build/bin/qpl_lz4_mixed_workload       # Mixed (NEW)
 ```
 
-### Benchmark Variants
+### Mixed Workload Benchmark (Updated 2026-01-27)
 
-| Benchmark | API | Best For | Latency | Throughput (SW) | Throughput (HW) |
-|-----------|-----|----------|---------|-----------------|-----------------|
-| `qpl_lz4_kv_bench_mt` | Sync (`qpl_execute_job`) | Point queries, latency-sensitive | ~14us | ~2.3 GB/s | ~1 GB/s |
-| `qpl_lz4_kv_bench_async` | Async (`qpl_submit/wait`) | Bulk ops, background tasks | ~100us | ~0.7 GB/s | **5-10 GB/s** (expected) |
+**Purpose**: Demonstrates IAA's value in **real-world scenarios** with concurrent read/write/compaction operations.
 
-> [!NOTE]
-> Async shows **no benefit on software path**. It's specifically designed to saturate Intel IAA hardware.
+#### Basic Usage
 
-### Environment Variables
-- `KV_QPL_PATH`: `auto` (default) | `software` | `hardware`
-- `KV_QPL_MODE`: `fixed` (default) | `dynamic` (+25% compression)
-- `KV_THREADS`: Worker threads (default: CPU count)
-- `KV_BATCH_SIZE`: Async batch size (default: 8)
-- `KV_BLOCK_SIZE`, `KV_BLOCKS`, `KV_OCCUPANCY_PCT`: Data generation params
+```bash
+# LZ4 baseline (default)
+KV_DURATION_SEC=60 ./build/bin/qpl_lz4_mixed_workload
 
-**Updated 2026-01-27**: Async benchmark now includes LZ4 baseline, dynamic Huffman support, and improved error messages.
+# QPL with auto hardware detection
+KV_CODEC=qpl KV_QPL_PATH=auto ./build/bin/qpl_lz4_mixed_workload
+
+# QPL with dynamic Huffman (+25% compression ratio)
+KV_CODEC=qpl KV_QPL_MODE=dynamic ./build/bin/qpl_lz4_mixed_workload
+```
+
+<!-- #### Environment Variables
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `KV_CODEC` | `lz4`, `qpl` | `lz4` | Compression codec |
+| `KV_QPL_PATH` | `auto`, `software`, `hardware` | `auto` | QPL execution path |
+| `KV_QPL_MODE` | `fixed`, `dynamic` | `fixed` | Huffman encoding mode |
+| `KV_THREADS` | 1-N | CPU count | Total worker threads |
+| `KV_DURATION_SEC` | 1-N | 60 | Benchmark duration |
+| `KV_READ_PCT` | 0-100 | 50 | % of read workers |
+| `KV_WRITE_PCT` | 0-100 | 30 | % of write workers |
+| `KV_COMPACT_PCT` | 0-100 | 20 | % of compaction workers |
+| `KV_CPU_WORK_US` | 0-N | 0.5 | CPU work per op (μs) |
+
+*Note: Percentages must sum to 100* -->
+
+#### Custom Workload Examples
+
+```bash
+# Write-heavy workload
+KV_READ_PCT=30 KV_WRITE_PCT=50 KV_COMPACT_PCT=20 \
+    ./build/bin/qpl_lz4_mixed_workload
+
+# Read-only workload (no compaction)
+KV_READ_PCT=100 KV_WRITE_PCT=0 KV_COMPACT_PCT=0 \
+    ./build/bin/qpl_lz4_mixed_workload
+
+# High CPU work (simulate complex tree operations)
+KV_CPU_WORK_US=2.0 ./build/bin/qpl_lz4_mixed_workload
+```
+
+#### Expected Results
+
+**Software Path** (validation):
+```
+Codec: LZ4                    | Codec: QPL (software)
+Total QPS: 13,428 K/s         | Total QPS: 12,904 K/s
+Read  P99: 0.00 us            | Read  P99: 1.19 us
+Write P99: 8.20 us            | Write P99: 18.84 us
+```
+
+
+### Other Benchmarks
 
 
 ### Software-path results (Silesia)

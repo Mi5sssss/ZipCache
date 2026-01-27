@@ -22,27 +22,42 @@ Key executables live in `DRAM-tier/build/bin/`. Examples:
 - `bpt_compressed_lz4_smoke`, `bpt_compressed_qpl_smoke` – basic smoke tests
 - `bpt_compressed_synthetic_test` – legacy synthetic benchmark
 
-## Benchmark Scripts (LZ4 vs QPL)
+## Benchmarks
 
-- KV-shaped microbench (Silesia payload by default): `DRAM-tier/tests/run_kv_bench.sh`
-  - Env knobs: `KV_BLOCK_SIZES` (default `4096 8192 16384`), `KV_QPL_PATH` (`software|hardware|auto`, default `software`), `KV_OCCUPANCY_PCT` (default 50), `KV_BLOCKS` (default 4096).
-- Tree end-to-end (rebuild per leaf size): `DRAM-tier/tests/run_tail_latency_sizes.sh`
-  - Env knob: `COMPRESSED_LEAF_SIZES` (default `4096 8192 16384`). Script edits `COMPRESSED_LEAF_SIZE`/`MAX_COMPRESSED_SIZE`, rebuilds `tail_latency_compare`, runs with `TAIL_LATENCY_USE_SILESIA=1`, and restores the header afterward.
-
-Quick one-click runs (after building `DRAM-tier/build`):
-
+### Quick Start
 ```bash
-# Microbench across 4K/8K/16K, software QPL, Silesia payload
+# Single-threaded codec benchmark
 sh ./tests/run_kv_bench.sh
 
-# Tree benchmark across 4K/8K/16K leaf sizes (rebuilds per size, restores header)
-sh ./tests/run_tail_latency_sizes.sh
-
-# Multi-threaded Throughput Benchmark (C++)
-# Measures scalability of QPL vs LZ4.
-# Set KV_THREADS to your CPU core count (e.g., 32).
+# Multi-threaded synchronous (low latency)
 KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_mt
+
+# Multi-threaded asynchronous (high throughput, optimized for IAA hardware)
+KV_THREADS=8 KV_BATCH_SIZE=8 ./build/bin/qpl_lz4_kv_bench_async
+
+# Dynamic Huffman mode (+25% compression ratio)
+KV_QPL_MODE=dynamic KV_THREADS=8 ./build/bin/qpl_lz4_kv_bench_async
 ```
+
+### Benchmark Variants
+
+| Benchmark | API | Best For | Latency | Throughput (SW) | Throughput (HW) |
+|-----------|-----|----------|---------|-----------------|-----------------|
+| `qpl_lz4_kv_bench_mt` | Sync (`qpl_execute_job`) | Point queries, latency-sensitive | ~14us | ~2.3 GB/s | ~1 GB/s |
+| `qpl_lz4_kv_bench_async` | Async (`qpl_submit/wait`) | Bulk ops, background tasks | ~100us | ~0.7 GB/s | **5-10 GB/s** (expected) |
+
+> [!NOTE]
+> Async shows **no benefit on software path**. It's specifically designed to saturate Intel IAA hardware.
+
+### Environment Variables
+- `KV_QPL_PATH`: `auto` (default) | `software` | `hardware`
+- `KV_QPL_MODE`: `fixed` (default) | `dynamic` (+25% compression)
+- `KV_THREADS`: Worker threads (default: CPU count)
+- `KV_BATCH_SIZE`: Async batch size (default: 8)
+- `KV_BLOCK_SIZE`, `KV_BLOCKS`, `KV_OCCUPANCY_PCT`: Data generation params
+
+**Updated 2026-01-27**: Async benchmark now includes LZ4 baseline, dynamic Huffman support, and improved error messages.
+
 
 ### Software-path results (Silesia)
 

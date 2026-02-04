@@ -60,25 +60,40 @@ KV_CODEC=qpl KV_QPL_PATH=auto ./build/bin/qpl_lz4_mixed_workload
 KV_CODEC=qpl KV_QPL_MODE=dynamic ./build/bin/qpl_lz4_mixed_workload
 ```
 
-<!-- #### Environment Variables
+#### Environment Variables
+
+Configure the benchmark using these environment variables:
 
 | Variable | Values | Default | Description |
 |----------|--------|---------|-------------|
+| **Compression Settings** ||||
 | `KV_CODEC` | `lz4`, `qpl` | `lz4` | Compression codec |
 | `KV_QPL_PATH` | `auto`, `software`, `hardware` | `auto` | QPL execution path |
-| `KV_QPL_MODE` | `fixed`, `dynamic` | `fixed` | Huffman encoding mode |
+| `KV_QPL_MODE` | `fixed`, `dynamic` | `fixed` | Huffman encoding mode (QPL only) |
+| **Workload Configuration** ||||
 | `KV_THREADS` | 1-N | CPU count | Total worker threads |
-| `KV_DURATION_SEC` | 1-N | 60 | Benchmark duration |
-| `KV_READ_PCT` | 0-100 | 50 | % of read workers |
-| `KV_WRITE_PCT` | 0-100 | 30 | % of write workers |
-| `KV_COMPACT_PCT` | 0-100 | 20 | % of compaction workers |
-| `KV_CPU_WORK_US` | 0-N | 0.5 | CPU work per op (μs) |
+| `KV_DURATION_SEC` | 1-N | 60 | Benchmark duration (seconds) |
+| `KV_READ_PCT` | 0-100 | 50 | Percentage of read workers |
+| `KV_WRITE_PCT` | 0-100 | 30 | Percentage of write workers |
+| `KV_COMPACT_PCT` | 0-100 | 20 | Percentage of compaction workers |
+| **Data & Performance** ||||
+| `KV_BLOCKS` | 1-N | 4096 | Number of data blocks |
+| `KV_BLOCK_SIZE` | bytes | 4096 | Size of each block |
+| `KV_OCCUPANCY_PCT` | 0-100 | 50 | Data occupancy percentage |
+| `KV_CPU_WORK_US` | 0-N | 0.5 | Simulated CPU work per op (μs) |
+| `KV_BATCH_SIZE` | 1-N | 8 | Batch size for compaction workers |
 
-*Note: Percentages must sum to 100* -->
+> [!NOTE]
+> - Worker percentages (`KV_READ_PCT`, `KV_WRITE_PCT`, `KV_COMPACT_PCT`) must sum to 100
+> - Total data size = `KV_BLOCKS` × `KV_BLOCK_SIZE` (default: 16 MB)
+> - Larger datasets reduce cache effects: try `KV_BLOCKS=65536` (256 MB) or `KV_BLOCKS=1000000` (4 GB)
 
 #### Custom Workload Examples
 
 ```bash
+# Large dataset (256 MB) for realistic cache miss patterns
+KV_BLOCKS=65536 ./build/bin/qpl_lz4_mixed_workload
+
 # Write-heavy workload
 KV_READ_PCT=30 KV_WRITE_PCT=50 KV_COMPACT_PCT=20 \
     ./build/bin/qpl_lz4_mixed_workload
@@ -89,6 +104,11 @@ KV_READ_PCT=100 KV_WRITE_PCT=0 KV_COMPACT_PCT=0 \
 
 # High CPU work (simulate complex tree operations)
 KV_CPU_WORK_US=2.0 ./build/bin/qpl_lz4_mixed_workload
+
+# Production-scale test (4 GB dataset, 384 threads)
+KV_BLOCKS=1000000 KV_THREADS=384 KV_DURATION_SEC=300 \
+    KV_CODEC=qpl KV_QPL_PATH=hardware \
+    ./build/bin/qpl_lz4_mixed_workload
 ```
 
 #### Expected Results

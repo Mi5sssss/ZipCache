@@ -49,6 +49,13 @@ struct LatencyStats {
     double p999_us;
 };
 
+// Shared compressed block storage
+struct CompressedBlock {
+    std::vector<uint8_t> data;
+    int compressed_size;
+    std::mutex lock;
+};
+
 struct SystemMetrics {
     std::atomic<uint64_t> read_ops{0};
     std::atomic<uint64_t> write_ops{0};
@@ -179,12 +186,13 @@ struct ThreadContext {
     bool use_dynamic_huffman;
     qpl_path_t qpl_path;
     
-    const uint8_t *src_base;
+    const uint8_t *src_base;  // Uncompressed source data
+    CompressedBlock *compressed_blocks;  // Shared compressed storage
     int total_blocks;
     size_t block_size;
+    int batch_size;  // For compaction workers
     
-    std::vector<uint8_t> compressed_buf;
-    std::vector<int> compressed_sizes;
+    std::vector<uint8_t> temp_buf;  // Thread-local temp buffer
     std::vector<uint8_t> decomp_buf;
     std::vector<double> latencies;
     
@@ -196,21 +204,34 @@ static void read_worker_lz4(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 1000);
     std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
     ctx.decomp_buf.resize(ctx.block_size);
+    std::vector<uint8_t> local_compressed(ctx.block_size);
     
     while (ctx.metrics->running) {
         int block_idx = block_dist(rng);
         simulate_cpu_work_us(ctx.cpu_work_us);
         
-        // Simple decompress (mock pre-compressed)
-        const char *src = (const char *)(ctx.src_base + block_idx * ctx.block_size);
-        char *dst = (char *)ctx.decomp_buf.data();
+        // Read compressed data from shared storage
+        int comp_size;
+        {
+            std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
+            comp_size = ctx.compressed_blocks[block_idx].compressed_size;
+            if (comp_size > 0) {
+                std::memcpy(local_compressed.data(), 
+                           ctx.compressed_blocks[block_idx].data.data(),
+                           comp_size);
+            }
+        }
         
-        auto t0 = std::chrono::steady_clock::now();
-        int out = LZ4_decompress_safe(src, dst, ctx.block_size / 2, ctx.block_size);
-        auto t1 = std::chrono::steady_clock::now();
-        
-        if (out > 0) {
-            ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        if (comp_size > 0) {
+            auto t0 = std::chrono::steady_clock::now();
+            int out = LZ4_decompress_safe((const char*)local_compressed.data(),
+                                         (char*)ctx.decomp_buf.data(),
+                                         comp_size, ctx.block_size);
+            auto t1 = std::chrono::steady_clock::now();
+            
+            if (out > 0) {
+                ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
         }
         ctx.metrics->read_ops++;
     }
@@ -220,6 +241,7 @@ static void read_worker_qpl(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 1000);
     std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
     ctx.decomp_buf.resize(ctx.block_size);
+    std::vector<uint8_t> local_compressed(ctx.block_size);
     
     // Initialize QPL job
     uint32_t job_size = 0;
@@ -232,21 +254,33 @@ static void read_worker_qpl(ThreadContext &ctx) {
         int block_idx = block_dist(rng);
         simulate_cpu_work_us(ctx.cpu_work_us);
         
-        const uint8_t *src = ctx.src_base + block_idx * ctx.block_size;
+        // Read compressed data from shared storage
+        int comp_size;
+        {
+            std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
+            comp_size = ctx.compressed_blocks[block_idx].compressed_size;
+            if (comp_size > 0) {
+                std::memcpy(local_compressed.data(),
+                           ctx.compressed_blocks[block_idx].data.data(),
+                           comp_size);
+            }
+        }
         
-        job->op = qpl_op_decompress;
-        job->next_in_ptr = (uint8_t *)src;
-        job->available_in = ctx.block_size / 2;
-        job->next_out_ptr = ctx.decomp_buf.data();
-        job->available_out = ctx.block_size;
-        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
-        
-        auto t0 = std::chrono::steady_clock::now();
-        qpl_status st = qpl_execute_job(job);
-        auto t1 = std::chrono::steady_clock::now();
-        
-        if (st == QPL_STS_OK) {
-            ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        if (comp_size > 0) {
+            job->op = qpl_op_decompress;
+            job->next_in_ptr = local_compressed.data();
+            job->available_in = comp_size;
+            job->next_out_ptr = ctx.decomp_buf.data();
+            job->available_out = ctx.block_size;
+            job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+            
+            auto t0 = std::chrono::steady_clock::now();
+            qpl_status st = qpl_execute_job(job);
+            auto t1 = std::chrono::steady_clock::now();
+            
+            if (st == QPL_STS_OK) {
+                ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
         }
         ctx.metrics->read_ops++;
     }
@@ -258,21 +292,28 @@ static void read_worker_qpl(ThreadContext &ctx) {
 static void write_worker_lz4(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 2000);
     std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
-    ctx.compressed_buf.resize(ctx.block_size * 2);
+    ctx.temp_buf.resize(ctx.block_size * 2);
     
     while (ctx.metrics->running) {
         int block_idx = block_dist(rng);
         simulate_cpu_work_us(ctx.cpu_work_us);
         
         const char *src = (const char *)(ctx.src_base + block_idx * ctx.block_size);
-        char *dst = (char *)ctx.compressed_buf.data();
         
         auto t0 = std::chrono::steady_clock::now();
-        int out = LZ4_compress_default(src, dst, ctx.block_size, ctx.block_size * 2);
+        int comp_size = LZ4_compress_default(src, (char*)ctx.temp_buf.data(),
+                                             ctx.block_size, ctx.block_size * 2);
         auto t1 = std::chrono::steady_clock::now();
         
-        if (out > 0) {
+        if (comp_size > 0) {
             ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            
+            // Write back to shared storage
+            std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
+            ctx.compressed_blocks[block_idx].data.resize(comp_size);
+            std::memcpy(ctx.compressed_blocks[block_idx].data.data(),
+                       ctx.temp_buf.data(), comp_size);
+            ctx.compressed_blocks[block_idx].compressed_size = comp_size;
         }
         ctx.metrics->write_ops++;
     }
@@ -281,7 +322,7 @@ static void write_worker_lz4(ThreadContext &ctx) {
 static void write_worker_qpl(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 2000);
     std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
-    ctx.compressed_buf.resize(ctx.block_size * 2);
+    ctx.temp_buf.resize(ctx.block_size * 2);
     
     uint32_t job_size = 0;
     qpl_get_job_size(ctx.qpl_path, &job_size);
@@ -298,7 +339,7 @@ static void write_worker_qpl(ThreadContext &ctx) {
         job->op = qpl_op_compress;
         job->next_in_ptr = (uint8_t *)src;
         job->available_in = ctx.block_size;
-        job->next_out_ptr = ctx.compressed_buf.data();
+        job->next_out_ptr = ctx.temp_buf.data();
         job->available_out = ctx.block_size * 2;
         job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_OMIT_VERIFY;
         if (ctx.use_dynamic_huffman) job->flags |= QPL_FLAG_DYNAMIC_HUFFMAN;
@@ -309,7 +350,15 @@ static void write_worker_qpl(ThreadContext &ctx) {
         auto t1 = std::chrono::steady_clock::now();
         
         if (st == QPL_STS_OK) {
+            int comp_size = job->total_out;
             ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            
+            // Write back to shared storage
+            std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
+            ctx.compressed_blocks[block_idx].data.resize(comp_size);
+            std::memcpy(ctx.compressed_blocks[block_idx].data.data(),
+                       ctx.temp_buf.data(), comp_size);
+            ctx.compressed_blocks[block_idx].compressed_size = comp_size;
         }
         ctx.metrics->write_ops++;
     }
@@ -412,6 +461,66 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> src_buf(blocks * block_size);
     fill_kv_blocks(src_buf.data(), blocks, occupancy, payload, block_size);
 
+    // Pre-compress all blocks
+    std::cerr << "Pre-compressing " << blocks << " blocks...\n";
+    std::vector<CompressedBlock> compressed_blocks(blocks);
+    
+    if (use_qpl) {
+        // Pre-compress with QPL
+        uint32_t job_size = 0;
+        qpl_get_job_size(qpath, &job_size);
+        std::vector<uint8_t> job_buf(job_size);
+        qpl_job *job = (qpl_job *)job_buf.data();
+        if (qpl_init_job(qpath, job) != QPL_STS_OK) die("qpl_init_job (init)");
+        
+        for (int i = 0; i < blocks; i++) {
+            compressed_blocks[i].data.resize(block_size * 2);
+            
+            job->op = qpl_op_compress;
+            job->next_in_ptr = src_buf.data() + i * block_size;
+            job->available_in = block_size;
+            job->next_out_ptr = compressed_blocks[i].data.data();
+            job->available_out = block_size * 2;
+            job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_OMIT_VERIFY;
+            if (use_dynamic_huffman) job->flags |= QPL_FLAG_DYNAMIC_HUFFMAN;
+            job->level = qpl_default_level;
+            
+            qpl_status st = qpl_execute_job(job);
+            if (st == QPL_STS_OK) {
+                compressed_blocks[i].compressed_size = job->total_out;
+                compressed_blocks[i].data.resize(job->total_out);
+            } else {
+                fprintf(stderr, "Pre-compression failed for block %d: %d\n", i, st);
+                compressed_blocks[i].compressed_size = 0;
+            }
+        }
+        qpl_fini_job(job);
+    } else {
+        // Pre-compress with LZ4
+        for (int i = 0; i < blocks; i++) {
+            compressed_blocks[i].data.resize(block_size * 2);
+            int comp_size = LZ4_compress_default(
+                (const char*)(src_buf.data() + i * block_size),
+                (char*)compressed_blocks[i].data.data(),
+                block_size, block_size * 2);
+            if (comp_size > 0) {
+                compressed_blocks[i].compressed_size = comp_size;
+                compressed_blocks[i].data.resize(comp_size);
+            } else {
+                compressed_blocks[i].compressed_size = 0;
+            }
+        }
+    }
+    
+    size_t total_compressed = 0;
+    for (const auto &blk : compressed_blocks) {
+        total_compressed += blk.compressed_size;
+    }
+    double ratio = (double)(blocks * block_size) / total_compressed;
+    std::cerr << "Compression ratio: " << ratio << "x "
+              << "(" << (blocks * block_size / 1024.0 / 1024.0) << " MB -> "
+              << (total_compressed / 1024.0 / 1024.0) << " MB)\n";
+
     std::cout << "=== Mixed Workload Benchmark ===\n";
     std::cout << "Duration: " << duration << "s\n";
     std::cout << "Codec: " << (use_qpl ? "QPL" : "LZ4");
@@ -434,6 +543,7 @@ int main(int argc, char **argv) {
         contexts[tid].use_dynamic_huffman = use_dynamic_huffman;
         contexts[tid].qpl_path = qpath;
         contexts[tid].src_base = src_buf.data();
+        contexts[tid].compressed_blocks = compressed_blocks.data();
         contexts[tid].total_blocks = blocks;
         contexts[tid].block_size = block_size;
         contexts[tid].metrics = &metrics;
@@ -452,6 +562,7 @@ int main(int argc, char **argv) {
         contexts[tid].use_dynamic_huffman = use_dynamic_huffman;
         contexts[tid].qpl_path = qpath;
         contexts[tid].src_base = src_buf.data();
+        contexts[tid].compressed_blocks = compressed_blocks.data();
         contexts[tid].total_blocks = blocks;
         contexts[tid].block_size = block_size;
         contexts[tid].metrics = &metrics;
@@ -470,8 +581,10 @@ int main(int argc, char **argv) {
         contexts[tid].use_dynamic_huffman = use_dynamic_huffman;
         contexts[tid].qpl_path = qpath;
         contexts[tid].src_base = src_buf.data();
+        contexts[tid].compressed_blocks = compressed_blocks.data();
         contexts[tid].total_blocks = blocks;
         contexts[tid].block_size = block_size;
+        contexts[tid].batch_size = batch_size;
         contexts[tid].metrics = &metrics;
         
         if (use_qpl) {

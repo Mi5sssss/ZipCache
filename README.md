@@ -43,7 +43,7 @@ KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_async       # Async
 KV_THREADS=32 ./build/bin/qpl_lz4_mixed_workload       # Mixed (NEW)
 ```
 
-### Mixed Workload Benchmark (Updated 2026-01-27)
+### Mixed Workload Benchmark (Updated 2026-02-04 - Bug Fix)
 
 **Purpose**: Demonstrates IAA's value in **real-world scenarios** with concurrent read/write/compaction operations.
 
@@ -93,13 +93,47 @@ KV_CPU_WORK_US=2.0 ./build/bin/qpl_lz4_mixed_workload
 
 #### Expected Results
 
-**Software Path** (validation):
+> [!NOTE]
+> Results updated 2026-02-04 after fixing benchmark bug (commit `64ea58a`). Previous version showed zero read latencies due to decompressing uncompressed data.
+
+**Software Path** (32 threads, 60s, Silesia corpus):
+
 ```
-Codec: LZ4                    | Codec: QPL (software)
-Total QPS: 13,428 K/s         | Total QPS: 12,904 K/s
-Read  P99: 0.00 us            | Read  P99: 1.19 us
-Write P99: 8.20 us            | Write P99: 18.84 us
+Codec: LZ4
+Compression Ratio: 2.62x (16 MB → 6.1 MB)
+Total QPS: 3,883.91 K/s
+Read  Ops: 188.1M (QPS: 3,135.02 K/s)
+  P50: 1.80 us, P99: 2.46 us, P999: 3.04 us
+Write Ops: 44.9M (QPS: 748.88 K/s)
+  P50: 6.46 us, P99: 9.37 us, P999: 14.14 us
+
+Codec: QPL (software, fixed Huffman)
+Compression Ratio: 2.54x (16 MB → 6.3 MB)
+Total QPS: 1,454.89 K/s
+Read  Ops: 43.3M (QPS: 721.31 K/s)
+  P50: 13.03 us, P99: 19.93 us, P999: 29.41 us
+Write Ops: 23.6M (QPS: 392.63 K/s)
+  P50: 13.79 us, P99: 19.88 us, P999: 30.76 us
+Compact Ops: 20.5M (background compaction)
+
+Codec: QPL (software, dynamic Huffman)
+Compression Ratio: 3.19x (16 MB → 5.0 MB)  ← +25% vs fixed
+Total QPS: 1,088.66 K/s
+Read  Ops: 41.1M (QPS: 685.28 K/s)
+  P50: 20.64 us, P99: 30.22 us, P999: 33.64 us
+Write Ops: 13.4M (QPS: 223.70 K/s)
+  P50: 36.76 us, P99: 47.17 us, P999: 53.49 us
+Compact Ops: 10.8M (background compaction)
 ```
+
+**Key Observations**:
+- LZ4 provides 2.7x higher throughput than QPL software (fixed)
+- **Dynamic Huffman** improves compression ratio by 25% (3.19x vs 2.54x)
+- Dynamic Huffman trades performance for compression: 25% slower than fixed
+- QPL shows lower latency variance (P999/P50 ~2.3x vs LZ4's ~1.7x)
+- QPL software mode enables background compaction workers
+
+**Hardware IAA Results**: Contact maintainers for hardware acceleration benchmarks.
 
 
 ### Other Benchmarks

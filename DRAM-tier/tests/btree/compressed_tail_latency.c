@@ -13,7 +13,12 @@
 #include <unistd.h>
 #include <time.h>
 
+#ifdef HAVE_ZLIB
+#include <zlib.h>
+#endif
+
 #include "bplustree_compressed.h"
+#include "compressed_test_utils.h"
 
 #define DEFAULT_KEY_COUNT 8192*16
 #define DEFAULT_SAMPLE_COUNT 4096*16
@@ -762,6 +767,19 @@ static int decompress_bucket(struct bplus_tree_compressed *tree,
         }
     }
 
+#ifdef HAVE_ZLIB
+    if (leaf->compression_algo == COMPRESS_ZLIB_ACCEL) {
+        uLongf produced = (uLongf)dst_capacity;
+        int status = uncompress((Bytef *)dst,
+                                &produced,
+                                (const Bytef *)leaf->compressed_data + entry->offset,
+                                (uLong)entry->length);
+        if (status == Z_OK && produced > 0 && produced <= (uLongf)dst_capacity) {
+            return (int)produced;
+        }
+    }
+#endif
+
     return LZ4_decompress_safe((const char *)leaf->compressed_data + entry->offset,
                                (char *)dst,
                                (int)entry->length,
@@ -1029,28 +1047,30 @@ static void run_lz4_variant(int level,
     bplus_tree_compressed_deinit(tree);
 }
 
-static void run_qpl_workloads(int default_subpages,
-                              const int *keys,
-                              const int *values,
-                              int key_count,
-                              const int *sample_keys,
-                              const int *sample_baseline,
-                              const int *sample_updated,
-                              int sample_count,
-                              int warmup_iters,
-                              FILE *csv,
-                              int verify_leaf_data,
-                              const struct samba_dataset *dataset,
-                              int debug)
+static void run_codec_workloads(compression_algo_t algo,
+                                int default_subpages,
+                                const int *keys,
+                                const int *values,
+                                int key_count,
+                                const int *sample_keys,
+                                const int *sample_baseline,
+                                const int *sample_updated,
+                                int sample_count,
+                                int warmup_iters,
+                                FILE *csv,
+                                int verify_leaf_data,
+                                const struct samba_dataset *dataset,
+                                int debug)
 {
-    struct compression_config qpl_cfg = bplus_tree_create_default_leaf_config(LEAF_TYPE_LZ4_HASHED);
-    qpl_cfg.algo = COMPRESS_QPL;
-    qpl_cfg.default_sub_pages = default_subpages;
+    struct compression_config cfg = bplus_tree_create_default_leaf_config(LEAF_TYPE_LZ4_HASHED);
+    cfg.algo = algo;
+    cfg.default_sub_pages = default_subpages;
+    btree_apply_qpl_env(&cfg);
 
     struct bplus_tree_compressed *tree =
-        bplus_tree_compressed_init_with_config(16, 32, &qpl_cfg);
+        bplus_tree_compressed_init_with_config(16, 32, &cfg);
     if (!tree) {
-        fprintf(stderr, "Failed to initialize QPL tree\n");
+        fprintf(stderr, "Failed to initialize %s tree\n", btree_algo_name(algo));
         exit(EXIT_FAILURE);
     }
     if (debug) {
@@ -1058,13 +1078,13 @@ static void run_qpl_workloads(int default_subpages,
     }
 
     if (debug) {
-        fprintf(stderr, "[qpl] populate %d keys\n", key_count);
+        fprintf(stderr, "[%s] populate %d keys\n", btree_algo_name(algo), key_count);
     }
     populate_tree(tree, keys, values, key_count, dataset);
 
     if (warmup_iters > 0) {
         if (debug) {
-            fprintf(stderr, "[qpl] warmup %d iters\n", warmup_iters);
+            fprintf(stderr, "[%s] warmup %d iters\n", btree_algo_name(algo), warmup_iters);
         }
         warmup_tree(tree, sample_keys, sample_baseline, sample_updated, warmup_iters, dataset);
         repopulate_baseline(tree, sample_keys, sample_baseline, sample_count, dataset);
@@ -1080,7 +1100,16 @@ static void run_qpl_workloads(int default_subpages,
     };
     int mix_count = (int)(sizeof(mixes) / sizeof(mixes[0]));
 
-    const char *algo_label = "QPL";
+    char algo_label[96];
+    if (algo == COMPRESS_QPL) {
+        snprintf(algo_label,
+                 sizeof(algo_label),
+                 "QPL(path=%s,mode=%s)",
+                 btree_qpl_path_name(cfg.qpl_path),
+                 btree_qpl_mode_name(cfg.qpl_huffman_mode));
+    } else {
+        snprintf(algo_label, sizeof(algo_label), "%s", btree_algo_name(algo));
+    }
 
     for (int m = 0; m < mix_count; m++) {
         repopulate_baseline(tree, sample_keys, sample_baseline, sample_count, dataset);
@@ -1108,7 +1137,7 @@ static void run_qpl_workloads(int default_subpages,
                          dataset);
 
         summarize_and_print(display_label, &samples);
-        if (tree->qpl_pool_size <= 0) {
+        if (algo == COMPRESS_QPL && tree->qpl_pool_size <= 0) {
             printf("  warning: QPL job pool not initialized; falling back to LZ4 path\n");
         }
         report_compression_stats(tree);
@@ -1249,19 +1278,36 @@ int main(void)
         fprintf(stderr, "[main] run QPL workloads\n");
     }
     fprintf(stderr, "[trace] before QPL workloads\n");
-    run_qpl_workloads(default_subpages,
-                      keys,
-                      values,
-                      key_count,
-                      sample_keys,
-                      sample_baseline,
-                      sample_updated,
-                      sample_count,
-                      warmup_iters,
-                      csv,
-                      use_samba_dataset,
-                      use_samba_dataset ? &dataset : NULL,
-                      debug);
+    run_codec_workloads(COMPRESS_QPL,
+                        default_subpages,
+                        keys,
+                        values,
+                        key_count,
+                        sample_keys,
+                        sample_baseline,
+                        sample_updated,
+                        sample_count,
+                        warmup_iters,
+                        csv,
+                        use_samba_dataset,
+                        use_samba_dataset ? &dataset : NULL,
+                        debug);
+
+    fprintf(stderr, "[trace] before zlib_accel workloads\n");
+    run_codec_workloads(COMPRESS_ZLIB_ACCEL,
+                        default_subpages,
+                        keys,
+                        values,
+                        key_count,
+                        sample_keys,
+                        sample_baseline,
+                        sample_updated,
+                        sample_count,
+                        warmup_iters,
+                        csv,
+                        use_samba_dataset,
+                        use_samba_dataset ? &dataset : NULL,
+                        debug);
 
     if (csv) {
         fclose(csv);

@@ -16,6 +16,9 @@
 
 #include <lz4.h>
 #include <qpl/qpl.h>
+#ifdef HAVE_ZLIB
+#include <zlib.h>
+#endif
 #include <unistd.h>
 #include <sys/wait.h>
 #include <limits.h>
@@ -61,6 +64,12 @@ struct SystemMetrics {
     std::atomic<uint64_t> write_ops{0};
     std::atomic<uint64_t> compact_ops{0};
     std::atomic<bool> running{true};
+};
+
+enum class Codec {
+    LZ4,
+    QPL,
+    ZLIB_ACCEL
 };
 
 // Helpers
@@ -288,6 +297,49 @@ static void read_worker_qpl(ThreadContext &ctx) {
     qpl_fini_job(job);
 }
 
+#ifdef HAVE_ZLIB
+static void read_worker_zlib(ThreadContext &ctx) {
+    std::mt19937 rng(ctx.thread_id * 1000);
+    std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
+    ctx.decomp_buf.resize(ctx.block_size);
+    std::vector<uint8_t> local_compressed(ctx.block_size * 2);
+
+    while (ctx.metrics->running) {
+        int block_idx = block_dist(rng);
+        simulate_cpu_work_us(ctx.cpu_work_us);
+
+        int comp_size;
+        {
+            std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
+            comp_size = ctx.compressed_blocks[block_idx].compressed_size;
+            if (comp_size > 0) {
+                if ((size_t)comp_size > local_compressed.size()) {
+                    local_compressed.resize(comp_size);
+                }
+                std::memcpy(local_compressed.data(),
+                           ctx.compressed_blocks[block_idx].data.data(),
+                           comp_size);
+            }
+        }
+
+        if (comp_size > 0) {
+            uLongf produced = (uLongf)ctx.decomp_buf.size();
+            auto t0 = std::chrono::steady_clock::now();
+            int status = uncompress((Bytef *)ctx.decomp_buf.data(),
+                                    &produced,
+                                    (const Bytef *)local_compressed.data(),
+                                    (uLong)comp_size);
+            auto t1 = std::chrono::steady_clock::now();
+
+            if (status == Z_OK) {
+                ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+            }
+        }
+        ctx.metrics->read_ops++;
+    }
+}
+#endif
+
 // === WRITE WORKER (Compress) ===
 static void write_worker_lz4(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 2000);
@@ -365,6 +417,42 @@ static void write_worker_qpl(ThreadContext &ctx) {
     
     qpl_fini_job(job);
 }
+
+#ifdef HAVE_ZLIB
+static void write_worker_zlib(ThreadContext &ctx) {
+    std::mt19937 rng(ctx.thread_id * 2000);
+    std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
+    ctx.temp_buf.resize(ctx.block_size * 2);
+
+    while (ctx.metrics->running) {
+        int block_idx = block_dist(rng);
+        simulate_cpu_work_us(ctx.cpu_work_us);
+
+        const uint8_t *src = ctx.src_base + block_idx * ctx.block_size;
+        uLongf produced = (uLongf)ctx.temp_buf.size();
+
+        auto t0 = std::chrono::steady_clock::now();
+        int status = compress2((Bytef *)ctx.temp_buf.data(),
+                               &produced,
+                               (const Bytef *)src,
+                               (uLong)ctx.block_size,
+                               Z_DEFAULT_COMPRESSION);
+        auto t1 = std::chrono::steady_clock::now();
+
+        if (status == Z_OK && produced > 0) {
+            int comp_size = (int)produced;
+            ctx.latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+
+            std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
+            ctx.compressed_blocks[block_idx].data.resize(comp_size);
+            std::memcpy(ctx.compressed_blocks[block_idx].data.data(),
+                       ctx.temp_buf.data(), comp_size);
+            ctx.compressed_blocks[block_idx].compressed_size = comp_size;
+        }
+        ctx.metrics->write_ops++;
+    }
+}
+#endif
 
 // === COMPACTION WORKER (Batch async compress) ===
 static void compaction_worker_qpl(ThreadContext &ctx, int batch_size) {
@@ -448,7 +536,22 @@ int main(int argc, char **argv) {
     bool use_dynamic_huffman = (huffman_mode == "dynamic");
     
     std::string codec = std::getenv("KV_CODEC") ? std::getenv("KV_CODEC") : "lz4";
-    bool use_qpl = (codec == "qpl" || codec == "QPL");
+    Codec selected_codec = Codec::LZ4;
+    if (codec == "qpl" || codec == "QPL") {
+        selected_codec = Codec::QPL;
+    } else if (codec == "zlib" || codec == "zlib_accel" || codec == "zlib-accel" ||
+               codec == "ZLIB" || codec == "ZLIB_ACCEL") {
+        selected_codec = Codec::ZLIB_ACCEL;
+    }
+    bool use_qpl = (selected_codec == Codec::QPL);
+    bool use_zlib = (selected_codec == Codec::ZLIB_ACCEL);
+
+#ifndef HAVE_ZLIB
+    if (use_zlib) {
+        fprintf(stderr, "ERROR: KV_CODEC=%s requires zlib at build time\n", codec.c_str());
+        return 1;
+    }
+#endif
 
     // Load data
     std::vector<uint8_t> payload;
@@ -495,6 +598,26 @@ int main(int argc, char **argv) {
             }
         }
         qpl_fini_job(job);
+    } else if (use_zlib) {
+#ifdef HAVE_ZLIB
+        // Pre-compress with zlib. LD_PRELOAD can route this through zlib-accel.
+        for (int i = 0; i < blocks; i++) {
+            compressed_blocks[i].data.resize(block_size * 2);
+            uLongf produced = (uLongf)compressed_blocks[i].data.size();
+            int status = compress2(
+                (Bytef *)compressed_blocks[i].data.data(),
+                &produced,
+                (const Bytef *)(src_buf.data() + i * block_size),
+                (uLong)block_size,
+                Z_DEFAULT_COMPRESSION);
+            if (status == Z_OK && produced > 0) {
+                compressed_blocks[i].compressed_size = (int)produced;
+                compressed_blocks[i].data.resize((size_t)produced);
+            } else {
+                compressed_blocks[i].compressed_size = 0;
+            }
+        }
+#endif
     } else {
         // Pre-compress with LZ4
         for (int i = 0; i < blocks; i++) {
@@ -523,7 +646,14 @@ int main(int argc, char **argv) {
 
     std::cout << "=== Mixed Workload Benchmark ===\n";
     std::cout << "Duration: " << duration << "s\n";
-    std::cout << "Codec: " << (use_qpl ? "QPL" : "LZ4");
+    std::cout << "Codec: ";
+    if (use_qpl) {
+        std::cout << "QPL";
+    } else if (use_zlib) {
+        std::cout << "zlib/zlib-accel";
+    } else {
+        std::cout << "LZ4";
+    }
     if (use_qpl) std::cout << " (" << qpl_mode_str << (use_dynamic_huffman ? ", dynamic)" : ", fixed)");
     std::cout << "\nThreads: " << total_threads << " (R=" << read_threads 
               << " W=" << write_threads << " C=" << compact_threads << ")\n";
@@ -550,6 +680,10 @@ int main(int argc, char **argv) {
         
         if (use_qpl) {
             workers.emplace_back(read_worker_qpl, std::ref(contexts[tid]));
+        } else if (use_zlib) {
+#ifdef HAVE_ZLIB
+            workers.emplace_back(read_worker_zlib, std::ref(contexts[tid]));
+#endif
         } else {
             workers.emplace_back(read_worker_lz4, std::ref(contexts[tid]));
         }
@@ -569,6 +703,10 @@ int main(int argc, char **argv) {
         
         if (use_qpl) {
             workers.emplace_back(write_worker_qpl, std::ref(contexts[tid]));
+        } else if (use_zlib) {
+#ifdef HAVE_ZLIB
+            workers.emplace_back(write_worker_zlib, std::ref(contexts[tid]));
+#endif
         } else {
             workers.emplace_back(write_worker_lz4, std::ref(contexts[tid]));
         }

@@ -24,6 +24,7 @@ Makefile
 *.boot
 test_*
 !DRAM-tier/tests/test_compression_concurrency.c
+!DRAM-tier/tests/legacy/test_legacy_simple_compression.c
 perf_test_*
 comparison_*
 

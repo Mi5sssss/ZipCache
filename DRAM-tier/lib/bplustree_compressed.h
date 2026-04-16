@@ -19,8 +19,9 @@
 
 // Legacy constants from btree.h
 #define KEY_SIZE 8
-#define COMPRESSED_VALUE_BYTES 64
-#define LANDING_BUFFER_BYTES 512
+#define COMPRESSED_VALUE_BYTES 128
+#define LANDING_BUFFER_DEFAULT_BYTES 512
+#define LANDING_BUFFER_BYTES 2048
 #define TOTAL_SUBPAGES_BYTES 4096
 
 
@@ -34,8 +35,14 @@ typedef enum {
 // Global compression algorithm selection (applies to unified hashed layout)
 typedef enum {
     COMPRESS_LZ4 = 0,
-    COMPRESS_QPL = 1
+    COMPRESS_QPL = 1,
+    COMPRESS_ZLIB_ACCEL = 2
 } compression_algo_t;
+
+typedef enum {
+    QPL_HUFFMAN_FIXED = 0,
+    QPL_HUFFMAN_DYNAMIC = 1
+} qpl_huffman_mode_t;
 
 // Original compression configuration (kept for backward compatibility)
 struct compression_config {
@@ -46,13 +53,15 @@ struct compression_config {
     int buffer_size;
     int flush_threshold;
     int enable_lazy_compression;
+    qpl_path_t qpl_path;
+    qpl_huffman_mode_t qpl_huffman_mode;
 };
 
 // Simplified compression configuration for dual algorithm support
 struct simple_compression_config {
     compression_algo_t default_algo;           // COMPRESS_LZ4 or COMPRESS_QPL
     int num_subpages;                         // Number of hash buckets (legacy style)
-    int buffer_size;                          // Landing buffer size (default 512)
+    int buffer_size;                          // Effective landing buffer bytes; max is LANDING_BUFFER_BYTES.
     int lz4_partial_decompression;            // Enable partial decompression for LZ4
     int qpl_compression_level;                // QPL compression level
     int enable_background_compression;        // Background thread support
@@ -67,7 +76,7 @@ struct subpage_index_entry {
 
 // Simplified leaf node structure with legacy 1D layout + dual compression
 struct simple_leaf_node {
-    char landing_buffer[LANDING_BUFFER_BYTES];  // 512 bytes (legacy style)
+    char landing_buffer[LANDING_BUFFER_BYTES];  // Max landing buffer; effective size is configurable.
     char *compressed_data;                      // Single compressed block
     int compressed_size;                        // Size of compressed data
     int num_subpages;                          // Number of hash buckets (legacy)
@@ -80,6 +89,7 @@ struct simple_leaf_node {
 
     // Per-leaf concurrency control
     pthread_rwlock_t rwlock;                   // Read-write lock for this leaf
+    uint64_t generation;                       // Incremented on leaf content changes
 
     // Statistics
     size_t uncompressed_bytes;
@@ -90,6 +100,8 @@ struct simple_leaf_node {
 // Thread-safe compressed B+Tree structure
 struct bplus_tree_compressed {
     struct bplus_tree *tree;                // Original B+Tree
+    struct bplus_tree_compressed **shards;  // Optional shard children
+    int shard_count;                        // >1 means this object routes to shards
     pthread_rwlock_t rwlock;                // Read-write lock for concurrency control
     int initialized;                        // Initialization flag
     int compression_enabled;                // Whether compression is enabled
@@ -111,11 +123,11 @@ struct bplus_tree_compressed {
     pthread_mutex_t qpl_pool_lock;         // Protects pool structures
     pthread_cond_t qpl_pool_cond;          // Signals job availability
 
-    // Global compression statistics
-    size_t total_uncompressed_size;         // Total uncompressed size
-    size_t total_compressed_size;           // Total compressed size
-    int compression_operations;             // Number of compression operations
-    int decompression_operations;           // Number of decompression operations
+    // Global compression statistics (atomic for lock-free concurrent updates)
+    size_t total_uncompressed_size;     // Total uncompressed size
+    size_t total_compressed_size;       // Total compressed size
+    int compression_operations;         // Number of compression operations
+    int decompression_operations;       // Number of decompression operations
 };
 
 /**

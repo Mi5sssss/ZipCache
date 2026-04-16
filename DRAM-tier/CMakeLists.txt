@@ -21,6 +21,13 @@ set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LZ4 REQUIRED liblz4)
 find_package(Threads REQUIRED)
+find_package(ZLIB)
+
+if(ZLIB_FOUND)
+    message(STATUS "Found zlib: ${ZLIB_VERSION}")
+else()
+    message(WARNING "zlib not found - zlib/zlib-accel backend will fall back to LZ4")
+endif()
 
 # Find Intel QPL library (portable)
 # Allow users to specify via environment variable QPL_ROOT or CMAKE_PREFIX_PATH

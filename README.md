@@ -1,217 +1,472 @@
-# ZipCache (DRAM/SSD Cache with Built‑in Transparent Compression)
+# ZipCache DRAM-tier B+Tree Compression Tests
 
-## Quick Start
+This repository currently focuses on the ZipCache DRAM-tier compressed B+Tree prototype. The active tests compare three compression paths:
 
-> [!NOTE]
-> If you want to use the Silesia corpus for benchmarks, please run `git submodule update --init SilesiaCorpus` first.
+- `LZ4`: CPU LZ4 baseline.
+- `QPL`: Intel QPL deflate path, configurable as software or IAA hardware.
+- `zlib_accel`: zlib API path. By default this is the system zlib backend; with `LD_PRELOAD=/path/to/libzlib_accel.so`, Intel zlib-accel can transparently choose hardware acceleration when available.
 
-All active development and tests build out of the `DRAM-tier` subdirectory. The
-top-level `build` folder is kept only for legacy binaries; please work inside
-`DRAM-tier` instead.
+The main goal of these tests is to measure real B+Tree behavior: tree traversal, leaf compression/decompression, landing buffer effects, sharding, concurrency, and whole-tree effective compression ratio.
 
-```bash
-cd DRAM-tier
-cmake -S . -B build
-cmake --build build -j$(nproc)
-```
+## Build
 
-Key executables live in `DRAM-tier/build/bin/`. Examples:
-
-- `tail_latency_compare` – synthetic latency mixes (read-only, 80/20 read/write)
-- `dcperf_workload_benchmark` – TaoBench-inspired size distribution and mix
-- `bpt_compressed_lz4_smoke`, `bpt_compressed_qpl_smoke` – basic smoke tests
-- `bpt_compressed_synthetic_test` – legacy synthetic benchmark
-
-## Benchmarks
-
-> [!NOTE]
-> All benchmarks use the Silesia corpus by default. Run `git submodule update --init SilesiaCorpus` first.
-
-### Quick Start
+From the repository root:
 
 ```bash
-# Build benchmarks
-cd DRAM-tier
-cmake --build build -j$(nproc)
+cd /home/xier2/2025-03-17-intel-zipcache/bplustree/bplustree
+git submodule update --init SilesiaCorpus
 
-# Run basic codec benchmark
-sh ./tests/run_kv_bench.sh
-
-# Run multi-threaded benchmarks
-KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_mt          # Sync
-KV_THREADS=32 ./build/bin/qpl_lz4_kv_bench_async       # Async
-KV_THREADS=32 ./build/bin/qpl_lz4_mixed_workload       # Mixed (NEW)
+cmake -S DRAM-tier -B DRAM-tier/build_check
+cmake --build DRAM-tier/build_check -j$(nproc)
 ```
 
-### Mixed Workload Benchmark (Updated 2026-02-04 - Bug Fix)
+Main binaries are under:
 
-**Purpose**: Demonstrates IAA's value in **real-world scenarios** with concurrent read/write/compaction operations.
+```text
+DRAM-tier/build_check/bin/
+```
 
-#### Basic Usage
+## What To Run First
+
+Run correctness smoke tests before collecting performance numbers:
 
 ```bash
-# LZ4 baseline (default)
-KV_DURATION_SEC=60 ./build/bin/qpl_lz4_mixed_workload
-
-# QPL with auto hardware detection
-KV_CODEC=qpl KV_QPL_PATH=auto ./build/bin/qpl_lz4_mixed_workload
-
-# QPL with dynamic Huffman (+25% compression ratio)
-KV_CODEC=qpl KV_QPL_MODE=dynamic ./build/bin/qpl_lz4_mixed_workload
+DRAM-tier/build_check/bin/bpt_compressed_lz4_smoke
+DRAM-tier/build_check/bin/bpt_compressed_qpl_smoke
+DRAM-tier/build_check/bin/bpt_compressed_zlib_accel_smoke
+DRAM-tier/build_check/bin/bpt_compressed_crud_fuzz
+DRAM-tier/build_check/bin/test_compression_concurrency
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+DRAM-tier/build_check/bin/bpt_compressed_split_payload_stats
 ```
 
-#### Environment Variables
+Expected result: all commands should pass. For `bpt_compressed_mixed_concurrency`, all printed codec rows should show `mismatches=0`.
 
-Configure the benchmark using these environment variables:
+Do not use `BTREE_OUT_OF_LOCK_REBUILD=1` for baseline claims. It is an experimental write-path rebuild prototype.
 
-| Variable | Values | Default | Description |
-|----------|--------|---------|-------------|
-| **Compression Settings** ||||
-| `KV_CODEC` | `lz4`, `qpl` | `lz4` | Compression codec |
-| `KV_QPL_PATH` | `auto`, `software`, `hardware` | `auto` | QPL execution path |
-| `KV_QPL_MODE` | `fixed`, `dynamic` | `fixed` | Huffman encoding mode (QPL only) |
-| **Workload Configuration** ||||
-| `KV_THREADS` | 1-N | CPU count | Total worker threads |
-| `KV_DURATION_SEC` | 1-N | 60 | Benchmark duration (seconds) |
-| `KV_READ_PCT` | 0-100 | 50 | Percentage of read workers |
-| `KV_WRITE_PCT` | 0-100 | 30 | Percentage of write workers |
-| `KV_COMPACT_PCT` | 0-100 | 20 | Percentage of compaction workers |
-| **Data & Performance** ||||
-| `KV_BLOCKS` | 1-N | 4096 | Number of data blocks |
-| `KV_BLOCK_SIZE` | bytes | 4096 | Size of each block |
-| `KV_OCCUPANCY_PCT` | 0-100 | 50 | Data occupancy percentage |
-| `KV_CPU_WORK_US` | 0-N | 0.5 | Simulated CPU work per op (μs) |
-| `KV_BATCH_SIZE` | 1-N | 8 | Batch size for compaction workers |
+## B+Tree Performance Tests
 
-> [!NOTE]
-> - Worker percentages (`KV_READ_PCT`, `KV_WRITE_PCT`, `KV_COMPACT_PCT`) must sum to 100
-> - Total data size = `KV_BLOCKS` × `KV_BLOCK_SIZE` (default: 16 MB)
-> - Larger datasets reduce cache effects: try `KV_BLOCKS=65536` (256 MB) or `KV_BLOCKS=1000000` (4 GB)
+There are two primary real B+Tree performance tests.
 
-#### Custom Workload Examples
+### Mixed Concurrency Test
+
+`bpt_compressed_mixed_concurrency` runs real tree operations with configurable read/write/delete/scan ratios. It first populates the tree, then starts the timed workload.
+
+Short local run:
 
 ```bash
-# Large dataset (256 MB) for realistic cache miss patterns
-KV_BLOCKS=65536 ./build/bin/qpl_lz4_mixed_workload
-
-# Write-heavy workload
-KV_READ_PCT=30 KV_WRITE_PCT=50 KV_COMPACT_PCT=20 \
-    ./build/bin/qpl_lz4_mixed_workload
-
-# Read-only workload (no compaction)
-KV_READ_PCT=100 KV_WRITE_PCT=0 KV_COMPACT_PCT=0 \
-    ./build/bin/qpl_lz4_mixed_workload
-
-# High CPU work (simulate complex tree operations)
-KV_CPU_WORK_US=2.0 ./build/bin/qpl_lz4_mixed_workload
-
-# Production-scale test (4 GB dataset, 384 threads)
-KV_BLOCKS=1000000 KV_THREADS=384 KV_DURATION_SEC=300 \
-    KV_CODEC=qpl KV_QPL_PATH=hardware \
-    ./build/bin/qpl_lz4_mixed_workload
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BTREE_THREADS=4 \
+BTREE_DURATION_SEC=1 \
+BTREE_KEY_SPACE=4096 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
 ```
 
-#### Expected Results
+Longer stress run:
 
-> [!NOTE]
-> Results updated 2026-02-04 after fixing benchmark bug (commit `64ea58a`). Previous version showed zero read latencies due to decompressing uncompressed data.
-
-**Software Path** (32 threads, 60s, Silesia corpus):
-
-```
-Codec: LZ4
-Compression Ratio: 2.62x (16 MB → 6.1 MB)
-Total QPS: 3,883.91 K/s
-Read  Ops: 188.1M (QPS: 3,135.02 K/s)
-  P50: 1.80 us, P99: 2.46 us, P999: 3.04 us
-Write Ops: 44.9M (QPS: 748.88 K/s)
-  P50: 6.46 us, P99: 9.37 us, P999: 14.14 us
-
-Codec: QPL (software, fixed Huffman)
-Compression Ratio: 2.54x (16 MB → 6.3 MB)
-Total QPS: 1,454.89 K/s
-Read  Ops: 43.3M (QPS: 721.31 K/s)
-  P50: 13.03 us, P99: 19.93 us, P999: 29.41 us
-Write Ops: 23.6M (QPS: 392.63 K/s)
-  P50: 13.79 us, P99: 19.88 us, P999: 30.76 us
-Compact Ops: 20.5M (background compaction)
-
-Codec: QPL (software, dynamic Huffman)
-Compression Ratio: 3.19x (16 MB → 5.0 MB)  ← +25% vs fixed
-Total QPS: 1,088.66 K/s
-Read  Ops: 41.1M (QPS: 685.28 K/s)
-  P50: 20.64 us, P99: 30.22 us, P999: 33.64 us
-Write Ops: 13.4M (QPS: 223.70 K/s)
-  P50: 36.76 us, P99: 47.17 us, P999: 53.49 us
-Compact Ops: 10.8M (background compaction)
+```bash
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BTREE_THREADS=32 \
+BTREE_DURATION_SEC=10 \
+BTREE_KEY_SPACE=50000 \
+BTREE_HOT_PCT=100 \
+BTREE_READ_PCT=50 \
+BTREE_WRITE_PCT=35 \
+BTREE_DELETE_PCT=10 \
+BTREE_SCAN_PCT=5 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
 ```
 
-**Key Observations**:
-- LZ4 provides 2.7x higher throughput than QPL software (fixed)
-- **Dynamic Huffman** improves compression ratio by 25% (3.19x vs 2.54x)
-- Dynamic Huffman trades performance for compression: 25% slower than fixed
-- QPL shows lower latency variance (P999/P50 ~2.3x vs LZ4's ~1.7x)
-- QPL software mode enables background compaction workers
+This binary runs LZ4, QPL, and zlib_accel in one execution and prints one result line per codec:
 
-**Hardware IAA Results**: Contact maintainers for hardware acceleration benchmarks.
+```text
+mixed_concurrency[lz4]: ...
+mixed_concurrency[qpl]: ...
+mixed_concurrency[zlib_accel]: ...
+```
 
+### Per-Operation Throughput Test
 
-### Other Benchmarks
+`bpt_compressed_throughput_bench` reports warmup, put/get/range/delete/stats, and mixed-workload throughput.
 
+```bash
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BENCH_THREADS=4 \
+BENCH_DURATION_SEC=1 \
+BENCH_WARMUP_KEYS=1000 \
+BENCH_KEY_SPACE=4096 \
+BENCH_OPS=1000 \
+DRAM-tier/build_check/bin/bpt_compressed_throughput_bench
+```
 
-### Software-path results (Silesia)
+Use a longer run for stable numbers:
 
-KV microbench (`run_kv_bench.sh`, occ=50%, blocks=4096, QPL=software): simulates leaf-shaped key/value payloads only (no tree traversal), to isolate codec throughput/latency. It performs a fresh compress/decompress per block (no landing buffer or other amortization), so absolute numbers can be lower than end-to-end trees where some work is avoided.
+```bash
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BENCH_THREADS=32 \
+BENCH_DURATION_SEC=10 \
+BENCH_WARMUP_KEYS=10000 \
+BENCH_KEY_SPACE=50000 \
+BENCH_OPS=10000 \
+DRAM-tier/build_check/bin/bpt_compressed_throughput_bench
+```
 
-| Block | LZ4 comp p50/p90/p95/p99 (µs) | LZ4 decomp p50/p90/p95/p99 (µs) | LZ4 ratio | LZ4  (comp/decomp) | QPL comp p50/p90/p95/p99 (µs) | QPL decomp p50/p90/p95/p99 (µs) | QPL ratio | QPL  (comp/decomp) |
-|-------|-------------------------------|----------------------------------|-----------|------------------------|--------------------------------|----------------------------------|-----------|-------------------------|
-| 4KB   | 9.7 / 11.6 / 12.2 / 17.5      | 1.58 / 1.84 / 1.93 / 2.13        | 2.63x     | ~410 MB/s / 2627 MB/s  | 18.98 / 22.04 / 23.01 / 25.21  | 7.80 / 9.30 / 9.85 / 10.84       | 2.55x     | ~206 MB/s / 503 MB/s    |
-| 8KB   | 13.57 / 18.24 / 19.53 / 22.72 | 2.83 / 3.17 / 3.28 / 3.73        | 3.21x     | ~560 MB/s / 2858 MB/s  | 31.38 / 38.48 / 40.54 / 43.79  | 13.01 / 16.44 / 17.45 / 19.30    | 3.11x     | ~251 MB/s / 607 MB/s    |
-| 16KB  | 26.87 / 31.33 / 32.70 / 36.83 | 5.72 / 6.21 / 6.38 / 6.97        | 3.26x     | ~606 MB/s / 2862 MB/s  | 62.60 / 73.89 / 77.38 / 83.23  | 25.14 / 30.44 / 32.49 / 35.90    | 3.06x     | ~254 MB/s / 628 MB/s    |
+## Scaling Sweep
 
-Tree end-to-end `tail_latency_compare` (`run_tail_latency_sizes.sh`, read-only p50, throughput Mops/s): includes tree traversal/buffering overhead in addition to codec cost.
+Use the sweep script to run multiple workloads, thread counts, shard counts, and landing-buffer sizes.
 
-| Leaf size | LZ4 p50 (µs) | LZ4 throughput (Mops/s) | LZ4 ratio | QPL p50 (µs) | QPL throughput (Mops/s) | QPL ratio |
-|-----------|--------------|-------------------------|-----------|--------------|-------------------------|-----------|
-| 4KB       | 0.923        | 1.13                    | 1.75x     | 5.77         | 0.19                    | 1.67x     |
-| 8KB       | 1.522        | 0.66                    | 2.07x     | 9.94         | 0.11                    | 1.94x     |
-| 16KB      | 3.053        | 0.33                    | 2.23x     | 19.35        | 0.05                    | 2.08x     |
+```bash
+SHARDS_LIST='1 8' \
+LANDING_LIST='512 2048' \
+THREADS_LIST='1 4 8 16 32' \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_DURATION_SEC=2 \
+BTREE_KEY_SPACE=50000 \
+BENCH_DURATION_SEC=2 \
+BENCH_WARMUP_KEYS=10000 \
+BENCH_KEY_SPACE=50000 \
+DRAM-tier/tests/btree/run_scaling_sweep.sh
+```
 
-Notes: All QPL numbers above are software path; hardware QPL (if available) may differ. Microbench isolates codec cost; tree results include traversal and buffering overhead.
+Output:
 
-### Test environment
+```text
+DRAM-tier/tests/btree/results/<timestamp>/summary.tsv
+DRAM-tier/tests/btree/results/<timestamp>/*.log
+```
 
-- CPU: Intel Xeon Gold 6134 @ 3.20GHz (x86_64, 32 cores, 46-bit physical / 48-bit virtual address, little endian).
+`summary.tsv` columns:
+
+| Column | Meaning |
+|---|---|
+| `case` | Workload type: `read_only`, `read_heavy`, `point_mixed`, `mixed_with_scan`, `write_heavy`, `bench_mixed`. |
+| `value_source` | `1` means Silesia samba payloads; `0` means synthetic payloads. |
+| `value_bytes` | Payload bytes copied into the current fixed-width record format. |
+| `landing_bytes` | Effective per-leaf software landing buffer size. |
+| `shards` | Number of hash shards behind the compressed tree coordinator. |
+| `threads` | Worker thread count. |
+| `codec` | `lz4`, `qpl`, or `zlib_accel`. |
+| `qps` | Operations per second. |
+| `mismatches` | Correctness mismatches; should be `0`. |
+| `ratio` | Whole-tree effective memory ratio: `total_bytes / compressed_bytes`. |
+| `saved_pct` | Whole-tree memory saved percentage. |
+| `compressed_bytes` | Resident compressed bytes plus uncompressed landing-buffer bytes. |
+| `total_bytes` | Resident logical KV bytes represented by the tree. |
+| `log` | Full log file for that run. |
+
+Note: `read_only` still has `ratio` because the benchmark populates the B+Tree before the timed read-only phase. The ratio is the final whole-tree resident memory ratio, not compression performed by read operations.
+
+## Switching Compression Paths
+
+### LZ4
+
+LZ4 is always included in B+Tree benchmark binaries. No environment variable is needed:
+
+```bash
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+Look for:
+
+```text
+mixed_concurrency[lz4]
+```
+
+### QPL Software
+
+Use QPL software mode when no IAA hardware is available or when collecting a software baseline:
+
+```bash
+BTREE_QPL_PATH=software \
+BTREE_QPL_MODE=fixed \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+Dynamic Huffman mode:
+
+```bash
+BTREE_QPL_PATH=software \
+BTREE_QPL_MODE=dynamic \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+Look for:
+
+```text
+mixed_concurrency[qpl]
+```
+
+### QPL IAA Hardware
+
+Use this only on an Intel IAA-capable machine. Hardware mode must fail fast if IAA is unavailable; this is intentional because silent fallback hides hardware setup or queue contention problems.
+
+Prepare IAA work queues:
+
+```bash
+cd /home/xier2/2025-03-17-intel-zipcache/bplustree/bplustree/DRAM-tier
+../scripts/enable_iax_user
+accel-config list | grep iax
+```
+
+Run fixed Huffman on hardware:
+
+```bash
+cd /home/xier2/2025-03-17-intel-zipcache/bplustree/bplustree
+BTREE_QPL_PATH=hardware \
+BTREE_QPL_MODE=fixed \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BTREE_THREADS=32 \
+BTREE_DURATION_SEC=10 \
+BTREE_KEY_SPACE=50000 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+Run dynamic Huffman on hardware:
+
+```bash
+BTREE_QPL_PATH=hardware \
+BTREE_QPL_MODE=dynamic \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BTREE_THREADS=32 \
+BTREE_DURATION_SEC=10 \
+BTREE_KEY_SPACE=50000 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+For IAA validation, do not use `BTREE_QPL_PATH=auto`. Use `hardware` so failures are visible.
+
+### zlib and Intel zlib-accel
+
+Without `LD_PRELOAD`, `zlib_accel` uses the normal zlib API backend:
+
+```bash
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+With Intel zlib-accel:
+
+```bash
+LD_PRELOAD=/path/to/libzlib_accel.so \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_THREADS=32 \
+BTREE_DURATION_SEC=10 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+Look for:
+
+```text
+mixed_concurrency[zlib_accel]
+```
+
+## Comparing Software vs IAA Hardware
+
+Run the same workload twice: first with `BTREE_QPL_PATH=software`, then with `BTREE_QPL_PATH=hardware`.
+
+Software baseline:
+
+```bash
+BTREE_QPL_PATH=software \
+BTREE_QPL_MODE=fixed \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BTREE_THREADS=32 \
+BTREE_DURATION_SEC=10 \
+BTREE_KEY_SPACE=50000 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+IAA hardware:
+
+```bash
+BTREE_QPL_PATH=hardware \
+BTREE_QPL_MODE=fixed \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+BTREE_THREADS=32 \
+BTREE_DURATION_SEC=10 \
+BTREE_KEY_SPACE=50000 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+Compare the `mixed_concurrency[qpl]` rows:
+
+```text
+qps=...
+ratio=...
+saved_pct=...
+mismatches=0
+```
+
+For a full sweep:
+
+```bash
+BTREE_QPL_PATH=software \
+BTREE_QPL_MODE=fixed \
+SHARDS_LIST='8' \
+LANDING_LIST='512 2048' \
+THREADS_LIST='1 4 8 16 32' \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+DRAM-tier/tests/btree/run_scaling_sweep.sh
+
+BTREE_QPL_PATH=hardware \
+BTREE_QPL_MODE=fixed \
+SHARDS_LIST='8' \
+LANDING_LIST='512 2048' \
+THREADS_LIST='1 4 8 16 32' \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+DRAM-tier/tests/btree/run_scaling_sweep.sh
+```
+
+If hardware QPS regresses at high thread counts while IAA utilization is not saturated, inspect IAA work queue count and thread-to-queue distribution. This was the suspected issue in prior Intel analysis.
+
+## Non-B+Tree Codec Benchmark
+
+`qpl_lz4_mixed_workload` does not run the B+Tree. It is useful for isolating codec behavior on ZipCache-like 4KB blocks.
+
+LZ4:
+
+```bash
+cd /home/xier2/2025-03-17-intel-zipcache/bplustree/bplustree/DRAM-tier
+KV_CODEC=lz4 \
+KV_BLOCKS=100000 \
+KV_THREADS=32 \
+KV_DURATION_SEC=60 \
+./build_check/bin/qpl_lz4_mixed_workload
+```
+
+QPL software:
+
+```bash
+KV_CODEC=qpl \
+KV_QPL_PATH=software \
+KV_QPL_MODE=fixed \
+KV_BLOCKS=100000 \
+KV_THREADS=32 \
+KV_DURATION_SEC=60 \
+./build_check/bin/qpl_lz4_mixed_workload
+```
+
+QPL hardware:
+
+```bash
+KV_CODEC=qpl \
+KV_QPL_PATH=hardware \
+KV_QPL_MODE=fixed \
+KV_BLOCKS=100000 \
+KV_THREADS=32 \
+KV_DURATION_SEC=60 \
+./build_check/bin/qpl_lz4_mixed_workload
+```
+
+zlib-accel path:
+
+```bash
+LD_PRELOAD=/path/to/libzlib_accel.so \
+KV_CODEC=zlib_accel \
+KV_BLOCKS=100000 \
+KV_THREADS=32 \
+KV_DURATION_SEC=60 \
+./build_check/bin/qpl_lz4_mixed_workload
+```
+
+## Important Environment Variables
+
+| Variable | Values | Default | Used by | Meaning |
+|---|---|---:|---|---|
+| `BTREE_QPL_PATH` | `auto`, `software`, `hardware` | `auto` | B+Tree tests | QPL execution path. Use `hardware` for IAA validation. |
+| `BTREE_QPL_MODE` | `fixed`, `dynamic` | `fixed` | B+Tree tests | QPL Huffman mode. |
+| `BTREE_USE_SILESIA` | `0`, `1` | `1` in sweep | B+Tree tests | Use `SilesiaCorpus/samba.zip` as real payload source. |
+| `BTREE_VALUE_BYTES` | bytes | `128` | B+Tree tests | Payload bytes copied into fixed-width records. |
+| `BTREE_SHARDS` | integer | `1` | B+Tree tests | Hash-sharded compressed B+Tree count. |
+| `BTREE_LANDING_BUFFER_BYTES` | `256`, `512`, `1024`, `2048` | `512` | B+Tree tests | Effective per-leaf software landing buffer size. |
+| `BTREE_THREADS` | integer | test-specific | `bpt_compressed_mixed_concurrency` | Worker threads. |
+| `BTREE_DURATION_SEC` | seconds | `2` | `bpt_compressed_mixed_concurrency` | Timed workload duration. |
+| `BTREE_KEY_SPACE` | integer | `50000` in sweep | B+Tree tests | Number of keys used by the workload. |
+| `BENCH_THREADS` | integer | test-specific | `bpt_compressed_throughput_bench` | Worker threads for mixed phase. |
+| `BENCH_DURATION_SEC` | seconds | `3` | `bpt_compressed_throughput_bench` | Mixed phase duration. |
+| `KV_CODEC` | `lz4`, `qpl`, `zlib_accel` | `lz4` | codec benchmark | Select one codec for non-B+Tree benchmark. |
+| `KV_QPL_PATH` | `auto`, `software`, `hardware` | `auto` | codec benchmark | QPL execution path. |
+| `KV_QPL_MODE` | `fixed`, `dynamic` | `fixed` | codec benchmark | QPL Huffman mode. |
+
+## Current Local Reference Results
+
+Short Silesia samba 128B sweep, 4 threads, 8 shards:
+
+| Case | Landing bytes | Codec | QPS | Mismatches | Ratio | Saved pct |
+|---|---:|---|---:|---:|---:|---:|
+| read_only | 512 | lz4 | 3,043,055.4 | 0 | 1.265 | 20.95 |
+| read_only | 512 | qpl | 622,578.2 | 0 | 1.240 | 19.35 |
+| read_only | 512 | zlib_accel | 333,647.6 | 0 | 1.395 | 28.34 |
+| write_heavy | 512 | lz4 | 1,095,140.6 | 0 | 1.328 | 24.69 |
+| write_heavy | 512 | qpl | 424,085.0 | 0 | 1.295 | 22.75 |
+| write_heavy | 512 | zlib_accel | 152,430.2 | 0 | 1.464 | 31.68 |
+| read_only | 2048 | lz4 | 5,030,195.5 | 0 | 1.013 | 1.31 |
+| read_only | 2048 | qpl | 4,522,192.6 | 0 | 1.013 | 1.30 |
+| read_only | 2048 | zlib_accel | 3,779,495.1 | 0 | 1.017 | 1.70 |
+| write_heavy | 2048 | lz4 | 2,010,276.6 | 0 | 1.138 | 12.09 |
+| write_heavy | 2048 | qpl | 1,111,282.8 | 0 | 1.123 | 10.92 |
+| write_heavy | 2048 | zlib_accel | 626,590.9 | 0 | 1.165 | 14.18 |
+
+Interpretation:
+
+- Larger landing buffers improve short-run QPS because they reduce recompression and QPL/zlib submissions.
+- Larger landing buffers reduce effective memory savings because more data remains uncompressed in the landing buffer.
+- 512B is the safer default for capacity-oriented ZipCache evaluation. 2048B is a throughput-oriented knob.
+
+## Current Limitations
+
+- The B+Tree still uses fixed integer keys and fixed inline payload slots:
+
+```c
+typedef int key_t;
+
+struct kv_pair {
+    key_t key;
+    int stored_value;
+    uint8_t payload[COMPRESSED_VALUE_BYTES];
+};
+```
+
+- `BTREE_VALUE_BYTES=128` is an interim benchmark format, not final arbitrary key/value support.
+- The next design step is a variable-length byte-key/byte-value API with a slotted leaf-page layout.
+- `BTREE_OUT_OF_LOCK_REBUILD=1` is experimental and should not be used for baseline claims.
+- Hardware IAA results must be collected on an IAA-capable machine with configured work queues.
 
 ## Key Paths
 
-- DRAM tier library: `DRAM-tier/lib/` (e.g., `bplustree_compressed.c`)
-- Benchmarks: `DRAM-tier/build/` (e.g., `2025-09-04_synthetic_compression_benchmark.md`)
-- SSD/LO tiers: `SSD-tier/`, `LO-tier/`
-
-## Minimal Usage (DRAM Tier)
-
-```c
-#include "DRAM-tier/lib/bplustree_compressed.h"
-
-struct compression_config cfg = {
-  .algo = COMPRESS_QPL,   // or COMPRESS_LZ4
-  .default_sub_pages = 16,
-  .compression_level = 0
-};
-
-struct bplus_tree_compressed *t =
-  bplus_tree_compressed_init_with_config(16, 64, &cfg);
-
-bplus_tree_compressed_put(t, key, value);
-bplus_tree_compressed_get(t, key);
-bplus_tree_compressed_deinit(t);
-```
-
-## Notes
-
-- Use Intel QPL to offload (de)compression when supported; falls back to software.
-- Super‑leaf under‑filling improves in‑SSD write reduction; page‑based DRAM→SSD eviction reduces host‑side write amplification.
+- Compressed B+Tree library: `DRAM-tier/lib/bplustree_compressed.c`
+- B+Tree tests: `DRAM-tier/tests/btree/`
+- Codec-only tests: `DRAM-tier/tests/codec/`
+- Test docs: `DRAM-tier/tests/btree/README.md`
+- Concurrency plan: `DRAM-tier/tests/btree/CONCURRENCY_SCALING_PLAN.md`
 
 ## Citation
 

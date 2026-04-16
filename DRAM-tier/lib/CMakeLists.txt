@@ -52,6 +52,11 @@ if(QPL_FOUND)
     endif()
 endif()
 
+if(ZLIB_FOUND)
+    target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME} ZLIB::ZLIB)
+    target_compile_definitions(${LIB_BPLUSTREE_COMPRESSED_NAME} PRIVATE HAVE_ZLIB=1)
+endif()
+
 # Create static library for compressed B+Tree
 add_library(${LIB_BPLUSTREE_COMPRESSED_NAME}_static STATIC ${LIB_BPLUSTREE_COMPRESSED_SRC})
 set_target_properties(${LIB_BPLUSTREE_COMPRESSED_NAME}_static PROPERTIES
@@ -73,4 +78,9 @@ if(QPL_FOUND)
     if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
         target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME}_static stdc++)
     endif()
+endif()
+
+if(ZLIB_FOUND)
+    target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME}_static ZLIB::ZLIB)
+    target_compile_definitions(${LIB_BPLUSTREE_COMPRESSED_NAME}_static PRIVATE HAVE_ZLIB=1)
 endif()

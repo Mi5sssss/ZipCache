@@ -10,10 +10,11 @@
 #include <time.h>
 
 #include "bplustree_compressed.h"
+#include "compressed_test_utils.h"
 
 #define DEFAULT_KEY_COUNT 65536
 #define DEFAULT_SAMPLE_COUNT 100000
-#define DEFAULT_NUM_SUBPAGES 16
+#define DEFAULT_NUM_SUBPAGES 1
 #define DEFAULT_WARMUP_COUNT 4096
 #define DEFAULT_HIT_RATIO 0.88
 #define DEFAULT_UPDATE_RATIO 0.07
@@ -584,29 +585,31 @@ static void run_lz4_variant(int level,
     bplus_tree_compressed_deinit(tree);
 }
 
-static void run_qpl_variant(int default_subpages,
-                            const int *keys,
-                            const int *values,
-                            int base_key_count,
-                            const int *sample_keys_init,
-                            int key_capacity,
-                            const int *size_ranges,
-                            const double *cdf,
-                            int bucket_count,
-                            int sample_count,
-                            int warmup_iters,
-                            double hit_ratio,
-                            double update_ratio,
-                            FILE *csv)
+static void run_codec_variant(compression_algo_t algo,
+                              int default_subpages,
+                              const int *keys,
+                              const int *values,
+                              int base_key_count,
+                              const int *sample_keys_init,
+                              int key_capacity,
+                              const int *size_ranges,
+                              const double *cdf,
+                              int bucket_count,
+                              int sample_count,
+                              int warmup_iters,
+                              double hit_ratio,
+                              double update_ratio,
+                              FILE *csv)
 {
     struct compression_config cfg = bplus_tree_create_default_leaf_config(LEAF_TYPE_LZ4_HASHED);
-    cfg.algo = COMPRESS_QPL;
+    cfg.algo = algo;
     cfg.default_sub_pages = default_subpages;
+    btree_apply_qpl_env(&cfg);
 
     struct bplus_tree_compressed *tree =
         bplus_tree_compressed_init_with_config(16, 32, &cfg);
     if (!tree) {
-        fprintf(stderr, "Failed to initialize QPL tree\n");
+        fprintf(stderr, "Failed to initialize %s tree\n", btree_algo_name(algo));
         exit(EXIT_FAILURE);
     }
 
@@ -645,7 +648,16 @@ static void run_qpl_variant(int default_subpages,
         exit(EXIT_FAILURE);
     }
 
-    const char *label = "QPL";
+    char label[96];
+    if (algo == COMPRESS_QPL) {
+        snprintf(label,
+                 sizeof(label),
+                 "QPL(path=%s,mode=%s)",
+                 btree_qpl_path_name(cfg.qpl_path),
+                 btree_qpl_mode_name(cfg.qpl_huffman_mode));
+    } else {
+        snprintf(label, sizeof(label), "%s", btree_algo_name(algo));
+    }
 
     for (int i = 0; i < sample_count; i++) {
         double r = (double)rand() / (double)RAND_MAX;
@@ -782,20 +794,37 @@ int main(void)
                         csv);
     }
 
-    run_qpl_variant(default_subpages,
-                    keys,
-                    values,
-                    key_count,
-                    keys,
-                    key_count + sample_count,
-                    size_ranges,
-                    cdf,
-                    bucket_count,
-                    sample_count,
-                    warmup_count,
-                    hit_ratio,
-                    update_ratio,
-                    csv);
+    run_codec_variant(COMPRESS_QPL,
+                      default_subpages,
+                      keys,
+                      values,
+                      key_count,
+                      keys,
+                      key_count + sample_count,
+                      size_ranges,
+                      cdf,
+                      bucket_count,
+                      sample_count,
+                      warmup_count,
+                      hit_ratio,
+                      update_ratio,
+                      csv);
+
+    run_codec_variant(COMPRESS_ZLIB_ACCEL,
+                      default_subpages,
+                      keys,
+                      values,
+                      key_count,
+                      keys,
+                      key_count + sample_count,
+                      size_ranges,
+                      cdf,
+                      bucket_count,
+                      sample_count,
+                      warmup_count,
+                      hit_ratio,
+                      update_ratio,
+                      csv);
 
     if (csv) {
         fclose(csv);

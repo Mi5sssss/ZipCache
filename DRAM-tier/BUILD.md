@@ -6,6 +6,7 @@
 - **CMake** >= 3.15
 - **GCC/G++** with C++11 support
 - **LZ4** development library
+- **zlib** development library for the optional zlib/zlib-accel backend
 - **Intel QPL (Query Processing Library)** for IAA hardware acceleration
 
 ### Installing Dependencies on CentOS/RHEL/Rocky Linux
@@ -16,6 +17,9 @@ sudo yum install cmake
 
 # Install LZ4
 sudo yum install lz4-devel
+
+# Install zlib
+sudo yum install zlib-devel
 
 # Install Intel QPL (if not already installed)
 # Follow Intel's QPL installation guide at:
@@ -30,6 +34,9 @@ sudo apt-get install build-essential cmake
 
 # Install LZ4
 sudo apt-get install liblz4-dev
+
+# Install zlib
+sudo apt-get install zlib1g-dev
 
 # Install Intel QPL
 # Follow Intel's QPL installation guide
@@ -63,6 +70,9 @@ Key benchmarks include:
 - `qpl_lz4_mixed_workload` - Mixed read/write workload with compression
 - `bplustree_demo` - B+Tree demo
 - `bpt_compressed_qpl_smoke` - QPL compression smoke test
+- `test_compression_concurrency` - Real compressed B+Tree concurrency smoke/stress test
+- `bpt_compressed_mixed_concurrency` - Real compressed B+Tree mixed read/write/delete/scan stress test
+- `bpt_compressed_split_payload_stats` - Split, payload, range membership, and stats consistency stress test
 
 ## Running Benchmarks
 
@@ -91,13 +101,22 @@ export KV_THREADS=32
 # 70% reads, 30% writes, 32 threads
 export KV_THREADS=32
 ./build/bin/qpl_lz4_mixed_workload
+
+# zlib API path; add LD_PRELOAD to try Intel zlib-accel offload
+KV_CODEC=zlib_accel ./build/bin/qpl_lz4_mixed_workload
+LD_PRELOAD=/path/to/libzlib_accel.so \
+    KV_CODEC=zlib_accel ./build/bin/qpl_lz4_mixed_workload
 ```
 
 ## Environment Variables
 
 - `KV_THREADS` - Number of worker threads (default: 8)
-- `KV_PATH` - QPL execution path: `hardware`, `software`, or `auto` (default: auto)
+- `KV_CODEC` - Compression codec: `lz4`, `qpl`, or `zlib_accel` (default: lz4)
+- `KV_QPL_PATH` - QPL execution path: `hardware`, `software`, or `auto` (default: auto)
 - `KV_BATCH_SIZE` - Batch size for async benchmarks (default: 8)
+- `BTREE_QPL_PATH` - B+Tree QPL path: `auto`, `software`, or `hardware`; hardware mode fails fast if IAA is unavailable.
+- `BTREE_QPL_MODE` - B+Tree QPL Huffman mode: `fixed` or `dynamic`.
+- `BTREE_THREADS`, `BTREE_KEYS_PER_THREAD`, `BTREE_DURATION_SEC`, `BTREE_KEY_SPACE`, and `BTREE_*_PCT` - Control the real B+Tree concurrency stress tests.
 
 ## Troubleshooting
 

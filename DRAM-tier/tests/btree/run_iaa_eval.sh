@@ -35,9 +35,13 @@ TIME_BIN="${TIME_BIN:-/usr/bin/time}"
 
 RUN_IAA="${RUN_IAA:-0}"
 RUN_QPL_DYNAMIC="${RUN_QPL_DYNAMIC:-1}"
+RUN_ZLIB_SOFTWARE_FALLBACK="${RUN_ZLIB_SOFTWARE_FALLBACK:-1}"
 RUN_ZLIB_ACCEL="${RUN_ZLIB_ACCEL:-0}"
 ZLIB_ACCEL_SO="${ZLIB_ACCEL_SO:-}"
-SOFTWARE_CODECS="${SOFTWARE_CODECS:-lz4 qpl}"
+QPL_EVAL_PATH="${QPL_EVAL_PATH:-${BTREE_QPL_PATH:-auto}}"
+LZ4_CODECS="${LZ4_CODECS:-lz4}"
+QPL_AUTO_CODECS="${QPL_AUTO_CODECS:-qpl}"
+ZLIB_SOFTWARE_FALLBACK_CODECS="${ZLIB_SOFTWARE_FALLBACK_CODECS:-zlib_accel}"
 IAA_CODECS="${IAA_CODECS:-qpl}"
 ZLIB_ACCEL_CODECS="${ZLIB_ACCEL_CODECS:-zlib_accel}"
 
@@ -621,11 +625,19 @@ run_config() {
     local zlib_backend="$4"
     local preload="$5"
 
-    if [[ "${run_label}" == "software_fixed" ]]; then
-        for codec_filter in ${SOFTWARE_CODECS}; do
+    if [[ "${run_label}" == "lz4_cpu" ]]; then
+        for codec_filter in ${LZ4_CODECS}; do
             run_workload_matrix_for_codec "${run_label}" "${qpl_path}" "${qpl_mode}" "${zlib_backend}" "${preload}" "${codec_filter}"
         done
-    elif [[ "${run_label}" == qpl_iaa_* ]]; then
+    elif [[ "${run_label}" == "qpl_auto_fixed" || "${run_label}" == "qpl_auto_dynamic" ]]; then
+        for codec_filter in ${QPL_AUTO_CODECS}; do
+            run_workload_matrix_for_codec "${run_label}" "${qpl_path}" "${qpl_mode}" "${zlib_backend}" "${preload}" "${codec_filter}"
+        done
+    elif [[ "${run_label}" == "zlib_software_fallback" ]]; then
+        for codec_filter in ${ZLIB_SOFTWARE_FALLBACK_CODECS}; do
+            run_workload_matrix_for_codec "${run_label}" "${qpl_path}" "${qpl_mode}" "${zlib_backend}" "${preload}" "${codec_filter}"
+        done
+    elif [[ "${run_label}" == qpl_hardware_* ]]; then
         for codec_filter in ${IAA_CODECS}; do
             run_workload_matrix_for_codec "${run_label}" "${qpl_path}" "${qpl_mode}" "${zlib_backend}" "${preload}" "${codec_filter}"
         done
@@ -643,22 +655,35 @@ run_config() {
 }
 
 echo "results: ${RUN_DIR}"
-echo "software baseline: LZ4 CPU and QPL software fixed"
-run_config "software_fixed" "software" "fixed" "none" ""
+echo "baseline: LZ4 CPU"
+run_config "lz4_cpu" "${QPL_EVAL_PATH}" "fixed" "none" ""
+
+echo "QPL auto fixed (QPL runtime selects software or hardware)"
+run_config "qpl_auto_fixed" "${QPL_EVAL_PATH}" "fixed" "none" ""
+
+if [[ "${RUN_QPL_DYNAMIC}" == "1" ]]; then
+    echo "QPL auto dynamic (QPL runtime selects software or hardware)"
+    run_config "qpl_auto_dynamic" "${QPL_EVAL_PATH}" "dynamic" "none" ""
+fi
+
+if [[ "${RUN_ZLIB_SOFTWARE_FALLBACK}" == "1" ]]; then
+    echo "software baseline: zlib API fallback path"
+    run_config "zlib_software_fallback" "${QPL_EVAL_PATH}" "fixed" "zlib_software_fallback" ""
+fi
 
 if [[ "${RUN_IAA}" == "1" ]]; then
-    echo "IAA QPL fixed"
-    run_config "qpl_iaa_fixed" "hardware" "fixed" "none" ""
+    echo "strict hardware diagnostic: QPL fixed"
+    run_config "qpl_hardware_fixed" "hardware" "fixed" "none" ""
 
     if [[ "${RUN_QPL_DYNAMIC}" == "1" ]]; then
-        echo "IAA QPL dynamic"
-        run_config "qpl_iaa_dynamic" "hardware" "dynamic" "none" ""
+        echo "strict hardware diagnostic: QPL dynamic"
+        run_config "qpl_hardware_dynamic" "hardware" "dynamic" "none" ""
     fi
 fi
 
 if [[ "${RUN_ZLIB_ACCEL}" == "1" ]]; then
     echo "zlib-accel preload: ${ZLIB_ACCEL_SO}"
-    run_config "zlib_accel" "software" "fixed" "zlib_accel_preload" "${ZLIB_ACCEL_SO}"
+    run_config "zlib_accel" "${QPL_EVAL_PATH}" "fixed" "zlib_accel_preload" "${ZLIB_ACCEL_SO}"
 fi
 
 echo "summary: ${SUMMARY}"

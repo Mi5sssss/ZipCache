@@ -22,7 +22,7 @@ These tests exercise the actual B+Tree or compressed B+Tree APIs.
 
 ## Runtime controls
 
-- QPL path: `BTREE_QPL_PATH=auto|software|hardware`. Hardware mode fails fast if IAA/QPL hardware is unavailable instead of silently falling back.
+- QPL path: `BTREE_QPL_PATH=auto|software|hardware`. Use `auto` for normal runs so the QPL runtime auto-detects the execution path. `software` and `hardware` are for forced-path debugging or strict diagnostics.
 - QPL Huffman mode: `BTREE_QPL_MODE=fixed|dynamic`.
 - zlib-accel: use `COMPRESS_ZLIB_ACCEL` tests as the zlib API baseline; enable Intel zlib-accel with `LD_PRELOAD=/path/to/libzlib_accel.so`.
 - Concurrency smoke: `BTREE_THREADS` and `BTREE_KEYS_PER_THREAD` control `test_compression_concurrency`.

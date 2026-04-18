@@ -76,17 +76,19 @@ Key benchmarks include:
 
 ## Running Benchmarks
 
-### QPL Async Benchmark (Recommended for IAA)
-This benchmark demonstrates the best QPL/IAA performance using asynchronous batched operations:
+### QPL Async Benchmark
+This benchmark demonstrates QPL performance using asynchronous batched operations. Use the default `auto` path for normal runs so the QPL runtime selects the execution path from the machine configuration.
 
 ```bash
-# Run with hardware IAA acceleration
+# Run with QPL auto path. If Intel IAA is configured for QPL, the runtime can use it.
 export KV_THREADS=32
-export KV_PATH=hardware
+export KV_PATH=auto
 ./build/bin/qpl_lz4_kv_bench_async
 
-# Run with QPL software path (for testing without IAA hardware)
+# Optional forced-path diagnostics only
 export KV_PATH=software
+./build/bin/qpl_lz4_kv_bench_async
+export KV_PATH=hardware
 ./build/bin/qpl_lz4_kv_bench_async
 ```
 
@@ -112,9 +114,9 @@ LD_PRELOAD=/path/to/libzlib_accel.so \
 
 - `KV_THREADS` - Number of worker threads (default: 8)
 - `KV_CODEC` - Compression codec: `lz4`, `qpl`, or `zlib_accel` (default: lz4)
-- `KV_QPL_PATH` - QPL execution path: `hardware`, `software`, or `auto` (default: auto)
+- `KV_QPL_PATH` - QPL execution path: `auto`, `software`, or `hardware` (default: auto). Use `auto` for normal evaluation.
 - `KV_BATCH_SIZE` - Batch size for async benchmarks (default: 8)
-- `BTREE_QPL_PATH` - B+Tree QPL path: `auto`, `software`, or `hardware`; hardware mode fails fast if IAA is unavailable.
+- `BTREE_QPL_PATH` - B+Tree QPL path: `auto`, `software`, or `hardware`. Use `auto` for normal evaluation so QPL follows the Intel runtime configuration; forced paths are for diagnostics.
 - `BTREE_QPL_MODE` - B+Tree QPL Huffman mode: `fixed` or `dynamic`.
 - `BTREE_THREADS`, `BTREE_KEYS_PER_THREAD`, `BTREE_DURATION_SEC`, `BTREE_KEY_SPACE`, and `BTREE_*_PCT` - Control the real B+Tree concurrency stress tests.
 

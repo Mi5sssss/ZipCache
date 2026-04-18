@@ -19,7 +19,7 @@ Detailed benchmark commands and result tables are kept separately in [DRAM-tier/
 | Codec | Path | Hardware Story |
 |---|---|---|
 | `LZ4` | CPU baseline | Always CPU. This is the baseline throughput/latency target. |
-| `QPL` | Intel QPL deflate | `BTREE_QPL_PATH=software` uses CPU. `BTREE_QPL_PATH=hardware` uses IAA and fails fast if IAA is unavailable. |
+| `QPL` | Intel QPL deflate | Default is `BTREE_QPL_PATH=auto`, letting the QPL runtime auto-detect whether to use IAA or software. |
 | `zlib-accel` | zlib API with optional Intel shim | Requires `LD_PRELOAD=<zlib-accel-build>/libzlib_accel.so` to use Intel zlib-accel. Without preload, it is only regular system zlib and is not a headline comparison target. |
 
 Hardware enablement is intentionally outside the B+Tree code. Intel QPL and zlib-accel own IAA device discovery, queue use, and fallback behavior. ZipCache controls how often and where it calls those APIs.
@@ -41,7 +41,7 @@ ZipCache does not directly configure Intel IAA work queues. QPL and zlib-accel a
 Implemented optimizations for QPL and zlib-accel:
 
 - Per-thread QPL job reuse: `BTREE_QPL_JOB_CACHE=thread` keeps QPL job state hot per worker thread, avoiding repeated `qpl_get_job_size` / `qpl_init_job` style setup on each compressed leaf operation.
-- QPL hardware fail-fast mode: `BTREE_QPL_PATH=hardware` is supported for evaluation so missing IAA configuration is exposed instead of silently falling back to software.
+- QPL auto path: `BTREE_QPL_PATH=auto` lets the Intel QPL runtime select hardware or software based on the machine configuration. `software` and `hardware` remain available for debugging or strict diagnostics.
 - QPL fixed and dynamic Huffman modes: `BTREE_QPL_MODE=fixed|dynamic` allows evaluating throughput-oriented fixed Huffman versus higher-compression dynamic Huffman.
 - Optional per-thread zlib stream reuse: `BTREE_ZLIB_STREAM_CACHE=thread` reduces repeated zlib stream setup overhead when using the zlib API or the zlib-accel preload shim.
 - Landing-buffer write absorption: recent writes are first stored in the per-leaf landing buffer, reducing immediate recompress operations and therefore reducing QPL/zlib-accel API submissions on write-heavy workloads.
@@ -100,7 +100,7 @@ The main benchmark driver is `DRAM-tier/tests/btree/run_iaa_eval.sh`; exact comm
 |---|---:|---|
 | `BTREE_SHARDS` | `1` in the library, `8` in evaluation scripts | Hash-sharded compressed B+Tree coordinator. |
 | `BTREE_LANDING_BUFFER_BYTES` | `512` | Effective per-leaf landing-buffer size. Larger values reduce recompression but reduce memory savings. |
-| `BTREE_QPL_PATH` | test-controlled | `software`, `hardware`, or `auto`; use `hardware` for IAA validation. |
+| `BTREE_QPL_PATH` | `auto` | `auto`, `software`, or `hardware`; use `auto` for normal evaluation so QPL follows the Intel runtime configuration. |
 | `BTREE_QPL_MODE` | `fixed` | `fixed` or `dynamic` Huffman mode. |
 | `BTREE_QPL_JOB_CACHE` | `thread` | Reuse per-thread QPL jobs. |
 | `BTREE_ZLIB_STREAM_CACHE` | `none` | Optional `thread` mode for zlib stream reuse. |

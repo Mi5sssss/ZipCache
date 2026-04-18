@@ -4,7 +4,7 @@ This document contains the benchmark commands and result tables for the ZipCache
 
 ## Evaluation Scope
 
-The benchmark compares real compressed B+Tree operations, not standalone codec microbenchmarks.
+The main benchmark compares real compressed B+Tree operations. A codec-only mixed workload is also included to isolate LZ4, QPL, and zlib/zlib-accel behavior on 4KB ZipCache-like blocks.
 
 Codecs and engines:
 
@@ -19,6 +19,13 @@ QPL `auto` follows the QPL C API definition of `qpl_path_auto`: auto-detection o
 In this codebase, `COMPRESS_ZLIB_ACCEL` calls the zlib API. It only becomes Intel zlib-accel when the process is run with the zlib-accel shared library preloaded. Without preload, the same benchmark path is reported as `zlib API software fallback`. If the Intel shim is preloaded but cannot offload to IAA/QAT and zlib fallback is enabled in the shim configuration, the row should still be reported as `engine=zlib_accel_preload`, because the selected runtime was zlib-accel.
 
 ## Build
+
+If the repository already exists, update the `restruct` branch first:
+
+```bash
+git checkout restruct
+git pull origin restruct
+```
 
 Run from the B+Tree repository root:
 
@@ -50,6 +57,169 @@ DRAM-tier/build_check/bin/bpt_compressed_split_payload_stats
 ```
 
 Expected result: every command passes. For `bpt_compressed_mixed_concurrency`, each codec row should show `mismatches=0`.
+
+## Quick 8-Thread Commands
+
+The commands below run real DRAM-tier compressed B+Tree workloads. `run_iaa_eval.sh` includes the LZ4 CPU baseline by default. It also includes QPL auto fixed/dynamic and the zlib API software fallback unless filtered through the script variables.
+
+Update and build:
+
+```bash
+git checkout restruct
+git pull origin restruct
+
+git submodule update --init SilesiaCorpus
+
+cmake -S DRAM-tier -B DRAM-tier/build_check
+cmake --build DRAM-tier/build_check -j$(nproc)
+```
+
+Default 8-thread B+Tree evaluation. This includes the LZ4 baseline:
+
+```bash
+THREADS_LIST='8' \
+BTREE_DURATION_SEC=5 \
+BTREE_KEY_SPACE=50000 \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+DRAM-tier/tests/btree/run_iaa_eval.sh
+```
+
+QPL auto evaluation after Intel IAA is configured. ZipCache still requests `qpl_path_auto`; the Intel QPL runtime selects the execution path:
+
+```bash
+QPL_EVAL_PATH=auto \
+BTREE_QPL_JOB_CACHE=thread \
+BTREE_ZLIB_STREAM_CACHE=thread \
+THREADS_LIST='8' \
+BTREE_DURATION_SEC=5 \
+BTREE_KEY_SPACE=50000 \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+DRAM-tier/tests/btree/run_iaa_eval.sh
+```
+
+zlib-accel evaluation. Replace `ZLIB_ACCEL_SO` with the actual path to `libzlib_accel.so`:
+
+```bash
+QPL_EVAL_PATH=auto \
+BTREE_QPL_JOB_CACHE=thread \
+BTREE_ZLIB_STREAM_CACHE=thread \
+RUN_ZLIB_ACCEL=1 \
+ZLIB_ACCEL_SO=/path/to/libzlib_accel.so \
+THREADS_LIST='8' \
+BTREE_DURATION_SEC=5 \
+BTREE_KEY_SPACE=50000 \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+DRAM-tier/tests/btree/run_iaa_eval.sh
+```
+
+If only the LZ4 baseline is needed, disable the other default rows:
+
+```bash
+QPL_AUTO_CODECS='' \
+RUN_QPL_DYNAMIC=0 \
+RUN_ZLIB_SOFTWARE_FALLBACK=0 \
+THREADS_LIST='8' \
+BTREE_DURATION_SEC=5 \
+BTREE_KEY_SPACE=50000 \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_LANDING_BUFFER_BYTES=512 \
+DRAM-tier/tests/btree/run_iaa_eval.sh
+```
+
+Results are written to:
+
+```text
+DRAM-tier/tests/btree/results/iaa_eval/<timestamp>/summary.tsv
+```
+
+## Codec-Only Mixed Workload
+
+This benchmark does not traverse the B+Tree. It isolates codec behavior on packed 4KB blocks generated from `SilesiaCorpus/samba.zip`, with no zero padding. It is useful for validating codec compression ratio, compression/decompression throughput, and codec-level latency before running full B+Tree tests.
+
+LZ4 CPU baseline:
+
+```bash
+KV_CODEC=lz4 \
+KV_THREADS=8 \
+KV_DURATION_SEC=5 \
+KV_BLOCKS=50000 \
+KV_BENCH_USE_SILESIA=1 \
+KV_PACKED_BLOCKS=1 \
+KV_CPU_WORK_US=0 \
+DRAM-tier/build_check/bin/qpl_lz4_mixed_workload
+```
+
+QPL auto fixed after Intel IAA is configured. `KV_QPL_PATH=auto` lets the QPL runtime select the execution path:
+
+```bash
+KV_CODEC=qpl \
+KV_QPL_PATH=auto \
+KV_QPL_MODE=fixed \
+KV_QPL_ASYNC_FOREGROUND=1 \
+KV_BATCH_SIZE=8 \
+KV_THREADS=8 \
+KV_DURATION_SEC=5 \
+KV_BLOCKS=50000 \
+KV_BENCH_USE_SILESIA=1 \
+KV_PACKED_BLOCKS=1 \
+KV_CPU_WORK_US=0 \
+DRAM-tier/build_check/bin/qpl_lz4_mixed_workload
+```
+
+QPL auto dynamic:
+
+```bash
+KV_CODEC=qpl \
+KV_QPL_PATH=auto \
+KV_QPL_MODE=dynamic \
+KV_QPL_ASYNC_FOREGROUND=1 \
+KV_BATCH_SIZE=8 \
+KV_THREADS=8 \
+KV_DURATION_SEC=5 \
+KV_BLOCKS=50000 \
+KV_BENCH_USE_SILESIA=1 \
+KV_PACKED_BLOCKS=1 \
+KV_CPU_WORK_US=0 \
+DRAM-tier/build_check/bin/qpl_lz4_mixed_workload
+```
+
+zlib-accel. Replace `ZLIB_ACCEL_SO` with the actual path to `libzlib_accel.so`:
+
+```bash
+LD_PRELOAD=/path/to/libzlib_accel.so \
+KV_CODEC=zlib_accel \
+KV_THREADS=8 \
+KV_DURATION_SEC=5 \
+KV_BLOCKS=50000 \
+KV_BENCH_USE_SILESIA=1 \
+KV_PACKED_BLOCKS=1 \
+KV_CPU_WORK_US=0 \
+DRAM-tier/build_check/bin/qpl_lz4_mixed_workload
+```
+
+Local software baseline collected without IAA and without zlib-accel preload:
+
+| Codec path | Ratio | Total QPS (K/s) | Read QPS (K/s) | Write QPS (K/s) | Read P50 (us) | Read P99 (us) | Write P50 (us) | Write P99 (us) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| LZ4 CPU | 2.051x | 1330.06 | 1036.00 | 133.91 | 2.52 | 4.01 | 11.07 | 19.20 |
+| QPL software fixed, sync foreground | 2.031x | 408.97 | 226.57 | 79.90 | 14.52 | 27.46 | 18.73 | 32.41 |
+| QPL software dynamic, sync foreground | 2.785x | 261.31 | 175.79 | 43.08 | 20.31 | 36.55 | 37.76 | 54.16 |
+| QPL software fixed, async foreground batch=8 | 2.031x | 363.16 | 200.01 | 74.03 | 15.31 | 21.60 | 19.25 | 28.26 |
+| QPL software dynamic, async foreground batch=8 | 2.785x | 247.87 | 163.89 | 41.23 | 19.91 | 28.26 | 38.88 | 57.02 |
+| zlib API software fallback | 2.876x | 151.25 | 123.09 | 13.68 | 25.15 | 37.16 | 124.42 | 190.97 |
+
+For this codec-only workload, total QPS includes read, write, and background compaction operations. The default thread split is `R=4 W=2 C=2` for `KV_THREADS=8` and workload percentages `50/30/20`.
 
 ## CPU-Aware QPL Auto Baseline Results
 

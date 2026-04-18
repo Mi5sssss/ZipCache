@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <strings.h>
 
 #include <lz4.h>
 #include <qpl/qpl.h>
@@ -32,6 +33,7 @@ extern "C" {
 #define DEFAULT_OCCUPANCY 50
 #define DEFAULT_BATCH_SIZE 8
 #define DEFAULT_DURATION_SEC 60
+#define DEFAULT_PACKED_BLOCKS 1
 
 // Workload percentages
 #define DEFAULT_READ_PCT 50
@@ -83,6 +85,24 @@ static double parse_env_double(const char *name, double fallback) {
     const char *v = std::getenv(name);
     if (!v || !*v) return fallback;
     try { return std::stod(v); } catch (...) { return fallback; }
+}
+
+static bool parse_env_bool(const char *name, bool fallback) {
+    const char *v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    if (!strcasecmp(v, "1") || !strcasecmp(v, "true") ||
+        !strcasecmp(v, "yes") || !strcasecmp(v, "on")) {
+        return true;
+    }
+    if (!strcasecmp(v, "0") || !strcasecmp(v, "false") ||
+        !strcasecmp(v, "no") || !strcasecmp(v, "off")) {
+        return false;
+    }
+    return fallback;
+}
+
+static bool qpl_async_foreground_enabled() {
+    return parse_env_bool("KV_QPL_ASYNC_FOREGROUND", false);
 }
 
 static void die(const char *msg) {
@@ -170,6 +190,33 @@ static void fill_kv_blocks(uint8_t *buf, int blocks, int occupancy_pct,
     }
 }
 
+static void fill_packed_blocks(uint8_t *buf, int blocks,
+                               const std::vector<uint8_t> &payload,
+                               size_t block_size) {
+    size_t payload_pos = 0;
+    uint32_t seed = 0x9e3779b9U;
+
+    for (int b = 0; b < blocks; b++) {
+        uint8_t *dst = buf + (size_t)b * block_size;
+        if (!payload.empty()) {
+            for (size_t off = 0; off < block_size;) {
+                if (payload_pos >= payload.size()) {
+                    payload_pos = 0;
+                }
+                size_t copy = std::min(block_size - off, payload.size() - payload_pos);
+                std::memcpy(dst + off, payload.data() + payload_pos, copy);
+                payload_pos += copy;
+                off += copy;
+            }
+        } else {
+            for (size_t off = 0; off < block_size; off++) {
+                seed = seed * 1664525U + 1013904223U;
+                dst[off] = (uint8_t)(seed >> 24);
+            }
+        }
+    }
+}
+
 static LatencyStats compute_stats(std::vector<double> &samples) {
     LatencyStats out = {0};
     if (samples.empty()) return out;
@@ -213,7 +260,7 @@ static void read_worker_lz4(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 1000);
     std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
     ctx.decomp_buf.resize(ctx.block_size);
-    std::vector<uint8_t> local_compressed(ctx.block_size);
+    std::vector<uint8_t> local_compressed(ctx.block_size * 2);
     
     while (ctx.metrics->running) {
         int block_idx = block_dist(rng);
@@ -225,6 +272,9 @@ static void read_worker_lz4(ThreadContext &ctx) {
             std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
             comp_size = ctx.compressed_blocks[block_idx].compressed_size;
             if (comp_size > 0) {
+                if ((size_t)comp_size > local_compressed.size()) {
+                    local_compressed.resize((size_t)comp_size);
+                }
                 std::memcpy(local_compressed.data(), 
                            ctx.compressed_blocks[block_idx].data.data(),
                            comp_size);
@@ -250,7 +300,7 @@ static void read_worker_qpl(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 1000);
     std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
     ctx.decomp_buf.resize(ctx.block_size);
-    std::vector<uint8_t> local_compressed(ctx.block_size);
+    std::vector<uint8_t> local_compressed(ctx.block_size * 2);
     
     // Initialize QPL job
     uint32_t job_size = 0;
@@ -269,6 +319,9 @@ static void read_worker_qpl(ThreadContext &ctx) {
             std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
             comp_size = ctx.compressed_blocks[block_idx].compressed_size;
             if (comp_size > 0) {
+                if ((size_t)comp_size > local_compressed.size()) {
+                    local_compressed.resize((size_t)comp_size);
+                }
                 std::memcpy(local_compressed.data(),
                            ctx.compressed_blocks[block_idx].data.data(),
                            comp_size);
@@ -295,6 +348,96 @@ static void read_worker_qpl(ThreadContext &ctx) {
     }
     
     qpl_fini_job(job);
+}
+
+static void read_worker_qpl_async(ThreadContext &ctx) {
+    std::mt19937 rng(ctx.thread_id * 1000);
+    std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
+
+    int batch_size = std::max(1, ctx.batch_size);
+    uint32_t job_size = 0;
+    qpl_get_job_size(ctx.qpl_path, &job_size);
+
+    std::vector<std::vector<uint8_t>> job_bufs(batch_size);
+    std::vector<qpl_job *> jobs(batch_size);
+    std::vector<std::vector<uint8_t>> local_compressed(batch_size);
+    std::vector<std::vector<uint8_t>> decomp_bufs(batch_size);
+    std::vector<int> comp_sizes(batch_size, 0);
+    std::vector<char> active(batch_size, 0);
+
+    for (int k = 0; k < batch_size; k++) {
+        job_bufs[k].resize(job_size);
+        jobs[k] = (qpl_job *)job_bufs[k].data();
+        if (qpl_init_job(ctx.qpl_path, jobs[k]) != QPL_STS_OK) die("qpl_init_job (read async)");
+        local_compressed[k].resize(ctx.block_size * 2);
+        decomp_bufs[k].resize(ctx.block_size);
+    }
+
+    while (ctx.metrics->running) {
+        int submitted = 0;
+        simulate_cpu_work_us(ctx.cpu_work_us);
+        auto t0 = std::chrono::steady_clock::now();
+
+        for (int k = 0; k < batch_size; k++) {
+            int block_idx = block_dist(rng);
+            active[k] = 0;
+            comp_sizes[k] = 0;
+
+            {
+                std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_idx].lock);
+                comp_sizes[k] = ctx.compressed_blocks[block_idx].compressed_size;
+                if (comp_sizes[k] > 0) {
+                    if ((size_t)comp_sizes[k] > local_compressed[k].size()) {
+                        local_compressed[k].resize((size_t)comp_sizes[k]);
+                    }
+                    std::memcpy(local_compressed[k].data(),
+                                ctx.compressed_blocks[block_idx].data.data(),
+                                comp_sizes[k]);
+                }
+            }
+
+            if (comp_sizes[k] <= 0) {
+                continue;
+            }
+
+            jobs[k]->op = qpl_op_decompress;
+            jobs[k]->next_in_ptr = local_compressed[k].data();
+            jobs[k]->available_in = comp_sizes[k];
+            jobs[k]->next_out_ptr = decomp_bufs[k].data();
+            jobs[k]->available_out = ctx.block_size;
+            jobs[k]->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+
+            qpl_status st = qpl_submit_job(jobs[k]);
+            if (st == QPL_STS_OK) {
+                active[k] = 1;
+                submitted++;
+            }
+        }
+
+        int completed = 0;
+        for (int k = 0; k < batch_size; k++) {
+            if (!active[k]) {
+                continue;
+            }
+            qpl_status st = qpl_wait_job(jobs[k]);
+            if (st == QPL_STS_OK) {
+                completed++;
+            }
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+        if (completed > 0) {
+            double per_op_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / completed;
+            for (int i = 0; i < completed; i++) {
+                ctx.latencies.push_back(per_op_us);
+            }
+        }
+        ctx.metrics->read_ops += submitted;
+    }
+
+    for (int k = 0; k < batch_size; k++) {
+        qpl_fini_job(jobs[k]);
+    }
 }
 
 #ifdef HAVE_ZLIB
@@ -418,6 +561,86 @@ static void write_worker_qpl(ThreadContext &ctx) {
     qpl_fini_job(job);
 }
 
+static void write_worker_qpl_async(ThreadContext &ctx) {
+    std::mt19937 rng(ctx.thread_id * 2000);
+    std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
+
+    int batch_size = std::max(1, ctx.batch_size);
+    uint32_t job_size = 0;
+    qpl_get_job_size(ctx.qpl_path, &job_size);
+
+    std::vector<std::vector<uint8_t>> job_bufs(batch_size);
+    std::vector<qpl_job *> jobs(batch_size);
+    std::vector<std::vector<uint8_t>> comp_bufs(batch_size);
+    std::vector<int> block_indices(batch_size, 0);
+    std::vector<char> active(batch_size, 0);
+
+    for (int k = 0; k < batch_size; k++) {
+        job_bufs[k].resize(job_size);
+        jobs[k] = (qpl_job *)job_bufs[k].data();
+        if (qpl_init_job(ctx.qpl_path, jobs[k]) != QPL_STS_OK) die("qpl_init_job (write async)");
+        comp_bufs[k].resize(ctx.block_size * 2);
+    }
+
+    while (ctx.metrics->running) {
+        int submitted = 0;
+        simulate_cpu_work_us(ctx.cpu_work_us);
+        auto t0 = std::chrono::steady_clock::now();
+
+        for (int k = 0; k < batch_size; k++) {
+            block_indices[k] = block_dist(rng);
+            const uint8_t *src = ctx.src_base + (size_t)block_indices[k] * ctx.block_size;
+            active[k] = 0;
+
+            jobs[k]->op = qpl_op_compress;
+            jobs[k]->next_in_ptr = (uint8_t *)src;
+            jobs[k]->available_in = ctx.block_size;
+            jobs[k]->next_out_ptr = comp_bufs[k].data();
+            jobs[k]->available_out = ctx.block_size * 2;
+            jobs[k]->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_OMIT_VERIFY;
+            if (ctx.use_dynamic_huffman) jobs[k]->flags |= QPL_FLAG_DYNAMIC_HUFFMAN;
+            jobs[k]->level = qpl_default_level;
+
+            qpl_status st = qpl_submit_job(jobs[k]);
+            if (st == QPL_STS_OK) {
+                active[k] = 1;
+                submitted++;
+            }
+        }
+
+        int completed = 0;
+        for (int k = 0; k < batch_size; k++) {
+            if (!active[k]) {
+                continue;
+            }
+            qpl_status st = qpl_wait_job(jobs[k]);
+            if (st == QPL_STS_OK && jobs[k]->total_out > 0) {
+                int comp_size = (int)jobs[k]->total_out;
+                std::lock_guard<std::mutex> lock(ctx.compressed_blocks[block_indices[k]].lock);
+                ctx.compressed_blocks[block_indices[k]].data.resize(comp_size);
+                std::memcpy(ctx.compressed_blocks[block_indices[k]].data.data(),
+                            comp_bufs[k].data(),
+                            comp_size);
+                ctx.compressed_blocks[block_indices[k]].compressed_size = comp_size;
+                completed++;
+            }
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+        if (completed > 0) {
+            double per_op_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / completed;
+            for (int i = 0; i < completed; i++) {
+                ctx.latencies.push_back(per_op_us);
+            }
+        }
+        ctx.metrics->write_ops += submitted;
+    }
+
+    for (int k = 0; k < batch_size; k++) {
+        qpl_fini_job(jobs[k]);
+    }
+}
+
 #ifdef HAVE_ZLIB
 static void write_worker_zlib(ThreadContext &ctx) {
     std::mt19937 rng(ctx.thread_id * 2000);
@@ -454,7 +677,51 @@ static void write_worker_zlib(ThreadContext &ctx) {
 }
 #endif
 
-// === COMPACTION WORKER (Batch async compress) ===
+// === COMPACTION WORKER (Background compress) ===
+static void compaction_worker_lz4(ThreadContext &ctx, int batch_size) {
+    std::mt19937 rng(ctx.thread_id * 3000);
+    std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
+    std::vector<uint8_t> comp_buf(ctx.block_size * 2);
+
+    while (ctx.metrics->running) {
+        for (int k = 0; k < batch_size; k++) {
+            int block_idx = block_dist(rng);
+            const char *src = (const char *)(ctx.src_base + (size_t)block_idx * ctx.block_size);
+            int out = LZ4_compress_default(src,
+                                           (char *)comp_buf.data(),
+                                           (int)ctx.block_size,
+                                           (int)comp_buf.size());
+            if (out > 0) {
+                ctx.metrics->compact_ops++;
+            }
+        }
+    }
+}
+
+#ifdef HAVE_ZLIB
+static void compaction_worker_zlib(ThreadContext &ctx, int batch_size) {
+    std::mt19937 rng(ctx.thread_id * 3000);
+    std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
+    std::vector<uint8_t> comp_buf(ctx.block_size * 2);
+
+    while (ctx.metrics->running) {
+        for (int k = 0; k < batch_size; k++) {
+            int block_idx = block_dist(rng);
+            const uint8_t *src = ctx.src_base + (size_t)block_idx * ctx.block_size;
+            uLongf produced = (uLongf)comp_buf.size();
+            int status = compress2((Bytef *)comp_buf.data(),
+                                   &produced,
+                                   (const Bytef *)src,
+                                   (uLong)ctx.block_size,
+                                   Z_DEFAULT_COMPRESSION);
+            if (status == Z_OK && produced > 0) {
+                ctx.metrics->compact_ops++;
+            }
+        }
+    }
+}
+#endif
+
 static void compaction_worker_qpl(ThreadContext &ctx, int batch_size) {
     std::mt19937 rng(ctx.thread_id * 3000);
     std::uniform_int_distribution<int> block_dist(0, ctx.total_blocks - 1);
@@ -509,6 +776,7 @@ int main(int argc, char **argv) {
     size_t block_size = (size_t)parse_env_int("KV_BLOCK_SIZE", DEFAULT_BLOCK_SIZE);
     int blocks = parse_env_int("KV_BLOCKS", DEFAULT_BLOCKS);
     int occupancy = parse_env_int("KV_OCCUPANCY_PCT", DEFAULT_OCCUPANCY);
+    bool packed_blocks = parse_env_bool("KV_PACKED_BLOCKS", DEFAULT_PACKED_BLOCKS);
     int duration = parse_env_int("KV_DURATION_SEC", DEFAULT_DURATION_SEC);
     double cpu_work_us = parse_env_double("KV_CPU_WORK_US", DEFAULT_CPU_WORK_US);
     
@@ -526,6 +794,7 @@ int main(int argc, char **argv) {
     int read_threads = (total_threads * read_pct) / 100;
     int write_threads = (total_threads * write_pct) / 100;
     int compact_threads = total_threads - read_threads - write_threads;
+    bool use_qpl_async_foreground = qpl_async_foreground_enabled();
     
     std::string qpl_mode_str = std::getenv("KV_QPL_PATH") ? std::getenv("KV_QPL_PATH") : "auto";
     qpl_path_t qpath = qpl_path_software;
@@ -562,7 +831,11 @@ int main(int argc, char **argv) {
     }
 
     std::vector<uint8_t> src_buf(blocks * block_size);
-    fill_kv_blocks(src_buf.data(), blocks, occupancy, payload, block_size);
+    if (packed_blocks) {
+        fill_packed_blocks(src_buf.data(), blocks, payload, block_size);
+    } else {
+        fill_kv_blocks(src_buf.data(), blocks, occupancy, payload, block_size);
+    }
 
     // Pre-compress all blocks
     std::cerr << "Pre-compressing " << blocks << " blocks...\n";
@@ -657,6 +930,14 @@ int main(int argc, char **argv) {
     if (use_qpl) std::cout << " (" << qpl_mode_str << (use_dynamic_huffman ? ", dynamic)" : ", fixed)");
     std::cout << "\nThreads: " << total_threads << " (R=" << read_threads 
               << " W=" << write_threads << " C=" << compact_threads << ")\n";
+    std::cout << "Input Layout: " << (packed_blocks ? "packed" : "kv-shaped")
+              << " block_size=" << block_size
+              << " occupancy=" << (packed_blocks ? 100 : occupancy) << "%\n";
+    if (use_qpl) {
+        std::cout << "QPL Foreground: "
+                  << (use_qpl_async_foreground ? "async batch" : "sync execute")
+                  << " batch_size=" << batch_size << "\n";
+    }
     std::cout << "CPU Work: " << cpu_work_us << "us/op\n\n";
 
     // Metrics
@@ -676,10 +957,15 @@ int main(int argc, char **argv) {
         contexts[tid].compressed_blocks = compressed_blocks.data();
         contexts[tid].total_blocks = blocks;
         contexts[tid].block_size = block_size;
+        contexts[tid].batch_size = batch_size;
         contexts[tid].metrics = &metrics;
         
         if (use_qpl) {
-            workers.emplace_back(read_worker_qpl, std::ref(contexts[tid]));
+            if (use_qpl_async_foreground) {
+                workers.emplace_back(read_worker_qpl_async, std::ref(contexts[tid]));
+            } else {
+                workers.emplace_back(read_worker_qpl, std::ref(contexts[tid]));
+            }
         } else if (use_zlib) {
 #ifdef HAVE_ZLIB
             workers.emplace_back(read_worker_zlib, std::ref(contexts[tid]));
@@ -699,10 +985,15 @@ int main(int argc, char **argv) {
         contexts[tid].compressed_blocks = compressed_blocks.data();
         contexts[tid].total_blocks = blocks;
         contexts[tid].block_size = block_size;
+        contexts[tid].batch_size = batch_size;
         contexts[tid].metrics = &metrics;
         
         if (use_qpl) {
-            workers.emplace_back(write_worker_qpl, std::ref(contexts[tid]));
+            if (use_qpl_async_foreground) {
+                workers.emplace_back(write_worker_qpl_async, std::ref(contexts[tid]));
+            } else {
+                workers.emplace_back(write_worker_qpl, std::ref(contexts[tid]));
+            }
         } else if (use_zlib) {
 #ifdef HAVE_ZLIB
             workers.emplace_back(write_worker_zlib, std::ref(contexts[tid]));
@@ -727,8 +1018,13 @@ int main(int argc, char **argv) {
         
         if (use_qpl) {
             workers.emplace_back(compaction_worker_qpl, std::ref(contexts[tid]), batch_size);
+        } else if (use_zlib) {
+#ifdef HAVE_ZLIB
+            workers.emplace_back(compaction_worker_zlib, std::ref(contexts[tid]), batch_size);
+#endif
+        } else {
+            workers.emplace_back(compaction_worker_lz4, std::ref(contexts[tid]), batch_size);
         }
-        // LZ4 compaction would be similar but sync
     }
 
     // Run

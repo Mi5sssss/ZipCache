@@ -23,6 +23,8 @@ Makefile
 *.db
 *.boot
 test_*
+!DRAM-tier/tests/test_compression_concurrency.c
+!DRAM-tier/tests/legacy/test_legacy_simple_compression.c
 perf_test_*
 comparison_*
 
@@ -40,6 +42,7 @@ Thumbs.db
 # Performance test outputs
 *.log
 *.prof
+DRAM-tier/tests/btree/results/iaa_eval/
 
 # Temporary files
 tmp/

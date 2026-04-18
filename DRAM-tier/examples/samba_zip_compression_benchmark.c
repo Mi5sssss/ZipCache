@@ -369,7 +369,7 @@ static benchmark_result_t run_benchmark(const struct chunk_dataset *dataset,
         .compression_level = 0,
         .buffer_size = 512,
         .flush_threshold = 10,
-        .enable_lazy_compression = 0
+        .enable_lazy_compression = 1
     };
 
     struct bplus_tree_compressed *ct_tree =

@@ -885,6 +885,15 @@ int bplus_tree_get_range(struct bplus_tree *tree, key_t key1, key_t key2)
     return data;
 }
 
+struct bplus_node *bplus_node_new(struct bplus_tree *tree, int type)
+{
+    if (type == BPLUS_TREE_LEAF) {
+        return (struct bplus_node *)leaf_new();
+    } else {
+        return (struct bplus_node *)non_leaf_new();
+    }
+}
+
 #ifdef _BPLUS_TREE_DEBUG
 struct node_backlog {
         /* Node backlogged */

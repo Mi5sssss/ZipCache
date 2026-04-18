@@ -1,0 +1,7 @@
+wall_sec=9.91
+user_sec=74.33
+sys_sec=19.86
+cpu_pct=949%
+max_rss_kb=53324
+voluntary_cs=13659
+involuntary_cs=5892

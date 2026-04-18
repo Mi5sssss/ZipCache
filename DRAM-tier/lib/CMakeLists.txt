@@ -34,8 +34,8 @@ set_target_properties(${LIB_BPLUSTREE_COMPRESSED_NAME} PROPERTIES
 )
 
 # Link compressed library with dependencies
-target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME} 
-    ${LZ4_LIBRARIES} 
+target_link_libraries(bplustree_compressed
+    ${LZ4_LIBRARIES}
     Threads::Threads
 )
 target_include_directories(${LIB_BPLUSTREE_COMPRESSED_NAME} PRIVATE ${LZ4_INCLUDE_DIRS})
@@ -50,6 +50,11 @@ if(QPL_FOUND)
     if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
         target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME} stdc++)
     endif()
+endif()
+
+if(ZLIB_FOUND)
+    target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME} ZLIB::ZLIB)
+    target_compile_definitions(${LIB_BPLUSTREE_COMPRESSED_NAME} PRIVATE HAVE_ZLIB=1)
 endif()
 
 # Create static library for compressed B+Tree
@@ -73,4 +78,9 @@ if(QPL_FOUND)
     if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
         target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME}_static stdc++)
     endif()
+endif()
+
+if(ZLIB_FOUND)
+    target_link_libraries(${LIB_BPLUSTREE_COMPRESSED_NAME}_static ZLIB::ZLIB)
+    target_compile_definitions(${LIB_BPLUSTREE_COMPRESSED_NAME}_static PRIVATE HAVE_ZLIB=1)
 endif()

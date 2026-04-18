@@ -182,7 +182,7 @@ benchmark_result_t run_benchmark(const test_scenario_t *scenario, compression_al
         .compression_level = 0,
         .buffer_size = 512,
         .flush_threshold = 10,
-        .enable_lazy_compression = 0
+        .enable_lazy_compression = 1
     };
     
     struct bplus_tree_compressed *ct_tree = bplus_tree_compressed_init_with_config(16, 64, &config);
@@ -214,12 +214,11 @@ benchmark_result_t run_benchmark(const test_scenario_t *scenario, compression_al
         // Generate synthetic value for this key
         generate_synthetic_value(value_buffer, scenario->random_bytes, scenario->zero_bytes);
         
-        // Calculate hash value for B+ tree storage
-        int hash_value = calculate_hash(value_buffer, VALUE_SIZE);
-        
         // Measure insertion latency
         double insert_start = get_time();
-        int insert_result = bplus_tree_compressed_put(ct_tree, i, hash_value);
+        int insert_result = bplus_tree_compressed_put_blob(ct_tree, i,
+                                                           (const uint8_t *)value_buffer,
+                                                           VALUE_SIZE);
         double insert_end = get_time();
         
         if (insert_result == 0) {

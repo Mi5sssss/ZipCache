@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(bplustree VERSION 2.0.0 LANGUAGES C)
+project(bplustree VERSION 2.0.0 LANGUAGES C CXX)
 
-# Set C standard
+# Set C/C++ standard
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set default build type to Release
 if(NOT CMAKE_BUILD_TYPE)
@@ -19,6 +21,13 @@ set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LZ4 REQUIRED liblz4)
 find_package(Threads REQUIRED)
+find_package(ZLIB)
+
+if(ZLIB_FOUND)
+    message(STATUS "Found zlib: ${ZLIB_VERSION}")
+else()
+    message(WARNING "zlib not found - zlib/zlib-accel backend will fall back to LZ4")
+endif()
 
 # Find Intel QPL library (portable)
 # Allow users to specify via environment variable QPL_ROOT or CMAKE_PREFIX_PATH

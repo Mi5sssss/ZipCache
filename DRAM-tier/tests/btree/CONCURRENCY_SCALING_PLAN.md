@@ -58,7 +58,7 @@ Current handoff status:
 
 - Baseline-safe optimizations are enabled by default: QPL TLS jobs, out-of-lock get decompression, hash sharding via `BTREE_SHARDS`, small-range point lookup, exact stats, and configurable landing-buffer size.
 - `BTREE_OUT_OF_LOCK_REBUILD=1` is still experimental and must not be used for baseline claims without fixing single-tree structural races.
-- Next recommended work is a longer sweep with `LANDING_LIST='512 1024 2048'` and `SHARDS_LIST='1 8 16'`, followed by either range-partitioned sharding or a safe deferred-reclamation design for read traversal.
+- Next recommended work is Phase 8 background landing-buffer compaction. The goal is to reduce foreground synchronous leaf rebuilds and codec/IAA stalls while keeping the landing-buffer throughput/capacity trade-off controllable by runtime variables.
 - The benchmark value payload width is now 128B (`COMPRESSED_VALUE_BYTES=128`) so Silesia 128B slices are stored inline instead of being truncated. This is an interim benchmark format only, not the final ZipCache key/value representation.
 - `run_scaling_sweep.sh` now defaults to `BTREE_USE_SILESIA=1` and `BTREE_VALUE_BYTES=128`, using continuous key order over continuous slices extracted from `SilesiaCorpus/samba.zip`.
 - Important limitation: the current compressed B+Tree still uses fixed `int key_t` keys and fixed-size inline value payload slots. It cannot yet accept arbitrary byte keys or arbitrary byte values from a test/workload without truncation or integer-key adaptation.
@@ -737,6 +737,673 @@ Acceptance criteria:
 - Existing integer-key smoke tests still pass through compatibility wrappers.
 - Whole-tree compression stats reflect actual key/value bytes.
 - Range scan behavior is explicitly correct for byte-key ordering, or the test is labeled point-only if using the temporary hash-routed mode.
+
+## Phase 8: Background Landing-Buffer Compaction
+
+Purpose:
+
+Move expensive landing-buffer merge/recompress work out of foreground `put()` when possible. This should reduce write-path p99/p999 latency and improve write-heavy throughput stability, especially for QPL hardware/IAA and zlib-style codecs where compression cost is much higher than a simple landing-buffer insert.
+
+Current foreground behavior:
+
+- `put()` first inserts into the per-leaf landing buffer when a free slot exists.
+- When the landing buffer is full, the foreground writer decompresses existing compressed subpages, merges landing entries, inserts the new entry, recompresses subpages, clears landing, and returns.
+- This creates latency spikes and makes foreground user threads directly pay for LZ4/QPL/zlib work.
+
+Implemented direction:
+
+- First implementation uses a conservative low-rate scan-only worker rather than a queued leaf pointer design.
+- This intentionally avoids queued-leaf lifetime hazards while delete/split/rebalance can free leaves.
+- The worker holds the tree read lock while scanning the leaf list, then uses leaf `trywrlock` by default.
+- If landing occupancy exceeds the high-watermark, it merges compressed data with landing entries, rebuilds compressed subpages, clears landing, and updates the leaf generation/stat fields.
+- Foreground still keeps the existing synchronous fallback when a landing buffer is full and the background worker has not compacted it yet. Correctness does not depend on the background thread running.
+
+Proposed runtime knobs:
+
+```text
+BTREE_BG_COMPACTION=0|1
+BTREE_BG_THREADS=N
+BTREE_BG_SCAN_INTERVAL_US=N
+BTREE_BG_LANDING_HIGH_WATERMARK_PCT=N
+BTREE_BG_LANDING_LOW_WATERMARK_PCT=N
+BTREE_BG_MAX_LEAVES_PER_PASS=N
+BTREE_BG_MAX_COMPACTIONS_PER_SEC=N
+BTREE_BG_TRYLOCK_ONLY=0|1
+```
+
+Initial default recommendation:
+
+- `BTREE_BG_COMPACTION=0` by default until correctness and IAA queue behavior are validated.
+- `BTREE_BG_THREADS=1` for first implementation.
+- `BTREE_BG_LANDING_HIGH_WATERMARK_PCT=75`.
+- `BTREE_BG_TRYLOCK_ONLY=1` to avoid background workers blocking foreground operations during early experiments.
+
+Implemented code:
+
+1. Added tree-level background state in `struct bplus_tree_compressed`:
+   - worker threads
+   - shutdown flag
+   - scan serialization lock
+   - tuning knobs
+   - `bg_passes`, `bg_compactions`, `bg_trylock_misses`, `bg_skipped`, and `bg_errors`.
+2. Added `compressed_leaf_flush_landing_locked()`:
+   - collects compressed and landing pairs using existing newest-landing-wins semantics.
+   - hashes all resident pairs into subpages.
+   - compresses subpages through the selected codec.
+   - clears landing buffer after installing the compressed image.
+3. Added background lifecycle:
+   - configured at tree init from `BTREE_BG_*`.
+   - starts after QPL initialization.
+   - stops before leaf/free cleanup in `bplus_tree_compressed_deinit()`.
+4. Added `bplus_tree_compressed_bg_stats()` and mixed-concurrency benchmark output:
+   - `bg_passes`
+   - `bg_compactions`
+   - `bg_trylock_misses`
+   - `bg_skipped`
+   - `bg_errors`.
+5. Sharded trees inherit the same behavior per shard because each shard initializes its own background worker when enabled. Aggregated background counters are returned by the top-level sharded tree.
+6. Added key-based dirty queue:
+   - foreground enqueues the written key when landing occupancy crosses high watermark.
+   - background workers pop keys, re-find the current owning leaf, and compact if still above watermark.
+   - this avoids storing raw leaf pointers and therefore avoids queued leaf lifetime hazards.
+7. Added foreground and queue counters:
+   - `fg_landing_full`
+   - `fg_sync_compactions`
+   - `fg_sync_compaction_errors`
+   - `fg_split_fallbacks`
+   - `bg_enqueue_attempts`
+   - `bg_enqueued`
+   - `bg_enqueue_duplicates`
+   - `bg_queue_full`
+   - `bg_queue_pops`.
+8. Added `bplus_tree_compressed_compaction_stats()` and exported the new counters through `bpt_compressed_mixed_concurrency` and `run_iaa_eval.sh`.
+9. Added `tail_latency_summary.tsv` generation in `run_iaa_eval.sh` when `RUN_TAIL_LATENCY=1`.
+10. Extended `tail_latency_compare` output to include p999 for both get and put latency.
+
+Important correctness constraints:
+
+- Background compaction must preserve "landing entries are newer than compressed entries" duplicate-key semantics.
+- It must not race with split/delete/rebalance. If structural operations can free a leaf, the first version should either require the tree read lock while compacting or use a safe queued-leaf lifetime rule.
+- Do not use background compaction with unsafe lock-free traversal or default-on out-of-lock rebuild until reclamation/lifetime is solved.
+- Sharded trees currently have one key-based dirty queue per shard.
+- Current scan-only implementation is lifetime-safe because it does not retain leaf pointers outside the tree read-locked scan.
+- Current key-based dirty queue is also lifetime-safe because it stores keys, not leaf pointers. The worker re-finds the leaf under tree read lock before compaction.
+
+Codec-specific expectations:
+
+| Codec | Expected benefit | Main risk | Suggested initial strength |
+|---|---|---|---|
+| LZ4 | Small to medium; mainly smoother write p99 | Background lock contention may erase gains | Low or off |
+| QPL software | Medium; avoids foreground dynamic/fixed deflate stalls | CPU contention | 1 worker, throttled |
+| QPL hardware/IAA | Potentially high for write-heavy workloads | IAA work-queue contention and foreground read-decompress interference | 1 worker first, then queue-aware tuning |
+| zlib/zlib-accel | Potentially high when compression is slow | CPU/runtime contention | 1 worker, throttled |
+
+Instrumentation required before making claims:
+
+- foreground synchronous compactions
+- background compactions
+- compaction failures / trylock misses
+- average and max landing occupancy
+- foreground put p50/p99/p999
+- foreground get p50/p99/p999
+- leaf lock wait time if practical
+- QPL submit/execute failures if practical
+- `ratio`, `saved_pct`, `compressed_bytes`, `total_bytes`
+
+Benchmark matrix:
+
+```bash
+for bg in 0 1; do
+  BTREE_BG_COMPACTION=$bg \
+  BTREE_BG_THREADS=1 \
+  BTREE_BG_LANDING_HIGH_WATERMARK_PCT=75 \
+  BTREE_BG_LANDING_LOW_WATERMARK_PCT=25 \
+  BTREE_SHARDS=8 \
+  BTREE_LANDING_BUFFER_BYTES=512 \
+  THREADS_LIST='4 8 16 32' \
+  DRAM-tier/tests/btree/run_iaa_eval.sh
+done
+```
+
+IAA-specific matrix:
+
+```bash
+RUN_IAA=1 \
+BTREE_BG_COMPACTION=1 \
+BTREE_BG_THREADS=<1|2|4> \
+BTREE_QPL_PATH=hardware \
+BTREE_QPL_MODE=<fixed|dynamic> \
+DRAM-tier/tests/btree/run_iaa_eval.sh
+```
+
+Acceptance criteria:
+
+- `mismatches=0` across LZ4/QPL/zlib-accel.
+- Foreground synchronous compactions decrease under write-heavy workloads.
+- `put` p99/p999 improves or stays flat.
+- `get` p99 does not regress materially.
+- Write-heavy and point-mixed QPS improve or stay flat.
+- Whole-tree `saved_pct` does not fall unexpectedly relative to the same landing-buffer size.
+- On IAA hardware, background compaction must not reduce QPL hardware throughput by saturating or contending on work queues.
+
+Local validation on non-IAA machine:
+
+Build and default correctness:
+
+```text
+cmake --build DRAM-tier/build_check -j$(nproc): passed
+bpt_compressed_crud_fuzz: passed
+bpt_compressed_split_payload_stats: passed
+bpt_compressed_mixed_concurrency: passed, mismatches=0, bg counters all 0 by default
+```
+
+Write-heavy synthetic short run, 4 threads, 2 seconds, 2048-key space, mix 20/70/10/0:
+
+| Background | LZ4 QPS | QPL software QPS | zlib QPS | Mismatches | Notes |
+|---|---:|---:|---:|---:|---|
+| off | 1,047,811 | 660,798 | 265,455 | 0 | Lower ratio because more data remains in landing buffers. |
+| on, 75% watermark | 1,031,066 | 713,116 | 280,292 | 0 | QPL/zlib improved; LZ4 slightly lower due to background CPU/lock contention. |
+| on, 50% watermark | 979,074 | 594,590 | 222,772 | 0 | Too aggressive for this CPU-only run; better ratio but lower QPS. |
+
+Handoff note:
+
+Implement Phase 8 before revisiting Phase 7 variable-length KV if the immediate goal is IAA promotion. Phase 8 directly targets the foreground compression stalls and queue-submission behavior Intel cares about; Phase 7 is required for final ZipCache API fidelity but is a larger storage-layout change.
+
+## Phase 8 TODO Checklist
+
+Use this checklist as the current handoff queue. The existing Phase 8 implementation now has a safe scan fallback plus a key-based dirty queue. Remaining work should be done incrementally with correctness tests after each item.
+
+### P8.1 Instrument Foreground Compaction - Done
+
+- Add counters for foreground synchronous landing-buffer compactions.
+- Add counters for foreground compaction failures that lead to leaf split.
+- Add counters for landing-buffer full events.
+- Expose these through a stats API similar to `bplus_tree_compressed_bg_stats()`.
+- Print these counters from `bpt_compressed_mixed_concurrency`.
+- Add them to `run_iaa_eval.sh` `summary.tsv`.
+
+Implemented:
+
+- `bplus_tree_compressed_compaction_stats()`
+- `fg_landing_full`
+- `fg_sync_compactions`
+- `fg_sync_compaction_errors`
+- `fg_split_fallbacks`
+- mixed-concurrency and `summary.tsv` output.
+
+Why this matters:
+
+Without foreground compaction counters, we can only see that background compaction happened. We cannot prove it reduced foreground stalls, which is the main Phase 8 claim.
+
+### P8.2 Add Tail-Latency Summary For Phase 8 - Mostly Done
+
+- Extend `run_iaa_eval.sh` so `RUN_TAIL_LATENCY=1` produces a compact TSV summary, not only logs/CSV files.
+- Include `get_p50/get_p99/get_p999` if available.
+- Include `put_p50/put_p99/put_p999` if available.
+- Add a `bg_compaction` column so results with `BTREE_BG_COMPACTION=0` and `1` are directly comparable.
+- Keep raw CSV/log files for deeper inspection.
+
+Implemented:
+
+- `tail_latency_summary.tsv`
+- get/put p50/p90/p99/p999/max/avg
+- throughput in Mops/s
+- raw CSV/log retention.
+
+Remaining:
+
+- Add explicit `bg_compaction`, `bg_threads`, and `bg_watermark` columns to `tail_latency_summary.tsv`.
+
+Why this matters:
+
+Background compaction may not always improve average QPS. Its strongest expected benefit is lower write tail latency, especially for QPL hardware/IAA and zlib-accel.
+
+### P8.3 Add Dirty Queue - Done With Key-Based Queue
+
+- Original leaf-pointer plan:
+  - `dirty_for_compaction`
+  - `compaction_queued`
+  - `compaction_in_progress`
+  - `last_compaction_generation`
+- Add per-shard dirty queue:
+  - bounded ring buffer or linked queue
+  - queue lock
+  - condition variable
+  - shutdown handling
+- Foreground `insert_into_leaf()` should enqueue the leaf once when landing occupancy crosses `BTREE_BG_LANDING_HIGH_WATERMARK_PCT`.
+- Background worker should prefer queued dirty leaves before falling back to low-rate scan.
+- Add `BTREE_BG_QUEUE_CAPACITY`.
+- Add queue stats:
+  - enqueue attempts
+  - successful enqueues
+  - duplicate enqueue skips
+  - queue full drops
+  - queue pops.
+
+Correctness requirement:
+
+Do not store raw leaf pointers in the queue unless leaf lifetime is protected. Start with either tree-read-lock protected queue processing, a leaf refcount, or an epoch/hazard scheme.
+
+Implemented:
+
+- Key-based dirty queue, not raw leaf-pointer queue.
+- `BTREE_BG_QUEUE_CAPACITY`.
+- Queue lock/condition variable/shutdown handling.
+- Background worker prefers queued dirty keys, then falls back to scan.
+- The worker re-finds the current leaf for the queued key under tree read lock.
+- Queue stats are exported in mixed benchmark and `summary.tsv`.
+
+Deferred:
+
+- Per-leaf queued/in-progress state is not required for key-based queue correctness but may still be useful later to reduce duplicate enqueue attempts.
+
+### P8.4 Protect Queued Leaf Lifetime - Avoided For Current Queue
+
+Choose one safe lifetime model before making dirty queue the default:
+
+| Option | Pros | Cons |
+|---|---|---|
+| Tree read lock held while popping/processing queued leaf | Simple and safe | Reduces concurrency and can block structural changes |
+| Leaf refcount | Good performance | More invasive; delete/split/free must respect refcount |
+| Epoch/RCU-style reclamation | Best long-term read scalability | Most complex; requires deferred free |
+
+Initial recommendation:
+
+Implement leaf refcount only for queued background compaction. Keep scan-only mode as fallback. Do not combine queued leaf pointers with unsafe free paths.
+
+Current implementation:
+
+- Avoids the problem by storing queued keys instead of leaf pointers.
+- Background worker finds the leaf under tree read lock and does not retain it after unlocking.
+- If a future implementation switches to leaf-pointer queue, this item becomes required again.
+
+### P8.5 Add Low-Watermark / Hysteresis
+
+- Implement `BTREE_BG_LANDING_LOW_WATERMARK_PCT`.
+- A leaf should not be requeued until occupancy rises above high watermark after being compacted below low watermark.
+- Keep high default at `75`, low default at `25`.
+
+Why this matters:
+
+Without hysteresis, hot leaves can be compacted too frequently, reducing QPS and increasing IAA queue pressure.
+
+### P8.6 Add Codec-Aware Budgeting
+
+- Implement `BTREE_BG_CODEC_BUDGET`.
+- Add separate budget for QPL hardware if possible:
+  - max background QPL operations per second
+  - max background QPL in-flight jobs if async path exists later
+- Keep LZ4 background compaction low/off by default.
+- Let QPL hardware/zlib-accel use more aggressive defaults only after IAA tests prove it helps.
+
+Why this matters:
+
+IAA is a shared accelerator. Background compaction can help by moving compression off foreground, but it can also hurt by saturating the same work queues used by foreground reads/writes.
+
+### P8.7 Add IAA Queue-Aware Scheduling
+
+- Stop treating all QPL calls as equal.
+- Separate foreground and background QPL job pools if QPL/IAA supports enough queues.
+- Add optional background-only QPL path/queue selection if available.
+- Add queue affinity or per-thread assignment so many threads do not submit to the same queue.
+- Track QPL execution failures and fallbacks.
+
+Why this matters:
+
+Intel's observed regression likely comes from submission-path or work-queue contention rather than raw IAA capacity. Phase 8 should not worsen that contention.
+
+### P8.8 Evaluate Sharded Background Thread Count
+
+- Current behavior: `BTREE_SHARDS=8` and `BTREE_BG_THREADS=1` creates one worker per shard, so 8 background workers total.
+- Add an option for global background worker budget across all shards.
+- Candidate env:
+  - `BTREE_BG_GLOBAL_THREADS=N`
+  - `BTREE_BG_THREADS_PER_SHARD=N`
+- Compare:
+  - one worker per shard
+  - one global worker
+  - fixed global pool of 2/4 workers.
+
+Why this matters:
+
+Per-shard workers scale well for CPU but may be too aggressive for IAA hardware queues.
+
+### P8.9 Integrate Background Compaction Into `run_iaa_eval.sh` - Partial
+
+- Add script-level matrix for `BTREE_BG_COMPACTION=0|1`.
+- Add `bg_compaction`, `bg_threads`, `bg_watermark`, and `bg_scan_interval_us` columns to `summary.tsv`.
+- Add a `RUN_BG_SWEEP=1` option that compares off vs on for all workloads.
+- Keep default off unless the user explicitly requests Phase 8.
+
+Implemented:
+
+- `summary.tsv` includes Phase 8 counters from mixed-concurrency output.
+- `tail_latency_summary.tsv` is generated when `RUN_TAIL_LATENCY=1`.
+
+Remaining:
+
+- Add explicit config columns: `bg_compaction`, `bg_threads`, `bg_watermark`, `bg_scan_interval_us`, and `bg_queue_capacity`.
+- Add `RUN_BG_SWEEP=1`.
+
+### P8.10 Acceptance Test Matrix
+
+Run this after each implementation step:
+
+```bash
+cmake --build DRAM-tier/build_check -j$(nproc)
+
+DRAM-tier/build_check/bin/bpt_compressed_crud_fuzz
+DRAM-tier/build_check/bin/test_compression_concurrency
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+DRAM-tier/build_check/bin/bpt_compressed_split_payload_stats
+
+BTREE_BG_COMPACTION=1 \
+BTREE_BG_THREADS=1 \
+BTREE_BG_LANDING_HIGH_WATERMARK_PCT=75 \
+BTREE_THREADS=4 \
+BTREE_DURATION_SEC=2 \
+BTREE_KEY_SPACE=2048 \
+BTREE_READ_PCT=20 \
+BTREE_WRITE_PCT=70 \
+BTREE_DELETE_PCT=10 \
+BTREE_SCAN_PCT=0 \
+DRAM-tier/build_check/bin/bpt_compressed_mixed_concurrency
+```
+
+Expected:
+
+- all tests pass
+- all mixed-concurrency rows show `mismatches=0`
+- `bg_errors` should be explained if nonzero
+- QPS should not collapse relative to `BTREE_BG_COMPACTION=0`
+- `saved_pct` should improve or stay within expected landing-buffer trade-off.
+
+## Phase 9: IAA Performance Sprint For QPL/zlib-accel API Paths
+
+Goal:
+
+Maximize throughput and tail latency for ZipCache DRAM-tier B+Tree when Intel has already configured QPL or zlib-accel to use IAA. The target is to make QPL/zlib-accel competitive with, and ideally faster than, LZ4 in write-heavy and mixed workloads. LZ4 remains the CPU baseline and must not be slowed down by QPL/zlib-specific changes.
+
+Assumptions:
+
+- Intel owns IAA enablement and runtime setup outside this repo.
+- QPL and zlib-accel are external codec APIs. B+Tree only controls how often and where it calls those APIs.
+- IAA benefit should appear mostly in compression-heavy paths: write-only, R:W 5:5, and R:W 2:8.
+- Read-only may still favor LZ4 because LZ4 decode is cheap and IAA/QPL/zlib have API overhead.
+
+Non-goals:
+
+- Do not remove or slow down LZ4.
+- Do not add B+Tree-owned IAA device setup, `accel-config`, queue provisioning, or low-level DSA/IAA queue management.
+- Do not build a generic codec runtime abstraction beyond what is needed for this performance sprint.
+- Do not require IAA for correctness tests.
+- Do not implement arbitrary variable-length KV layout in this phase.
+
+Implemented in the current Phase 9 pass:
+
+- Added B+Tree-side codec API counters:
+  - `qpl_compress_calls`
+  - `qpl_decompress_calls`
+  - `qpl_tls_jobs`
+  - `qpl_pool_jobs`
+  - `qpl_errors`
+  - `zlib_compress_calls`
+  - `zlib_decompress_calls`
+  - `zlib_stream_reuses`
+  - `zlib_stream_inits`
+  - `zlib_errors`
+- Added `bplus_tree_compressed_codec_stats()` with shard aggregation.
+- Added `BTREE_QPL_JOB_CACHE=thread|pool`.
+  - `thread` is the default and uses the existing thread-local QPL job reuse path.
+  - `pool` disables TLS jobs and uses the retained global QPL job pool for comparison/debugging.
+- Added optional `BTREE_ZLIB_STREAM_CACHE=none|thread`.
+  - `none` is the default and preserves the previous `compress2()`/`uncompress()` behavior.
+  - `thread` reuses per-thread `z_stream` objects for independent leaf blocks.
+- Extended `bpt_compressed_mixed_concurrency` output with codec API counters.
+- Extended `run_iaa_eval.sh summary.tsv` with codec cache labels and counters.
+- Added `BTREE_BG_CODEC=all|lz4|qpl|zlib_accel` so background compaction can target QPL/zlib paths without perturbing LZ4.
+- Added `RUN_BG_SWEEP=1`, `BG_SWEEP_VALUES`, and `LANDING_LIST` to `run_iaa_eval.sh` so Intel can sweep background compaction and landing-buffer size with one command.
+- Verified that LZ4 rows report zero QPL/zlib API calls, so the LZ4 fast path is not routed through Phase 9 runtime logic.
+- Added `BTREE_CODEC_FILTER=all|lz4|qpl|zlib|zlib_accel` to `bpt_compressed_mixed_concurrency`.
+- Updated `run_iaa_eval.sh` to run each codec in a separate process instead of timing all codecs together. This makes CPU usage meaningful for LZ4 vs QPL vs zlib-accel comparisons.
+- Added benchmark-side timed-window CPU metrics with `getrusage()`.
+- Added default `COLLECT_CPU=1` process-level RSS/context-switch metrics through `/usr/bin/time`.
+- Extended `summary.tsv` with `wall_sec`, `user_sec`, `sys_sec`, `cpu_pct`, `cpu_cores`, `qps_per_cpu_core`, `max_rss_kb`, `voluntary_cs`, and `involuntary_cs`.
+- Added `SOFTWARE_CODECS`, `IAA_CODECS`, and `ZLIB_ACCEL_CODECS` filters to keep hardware runs focused while preserving the software baseline matrix.
+
+### P9.1 QPL Job Reuse
+
+Status: implemented for the main B+Tree path.
+
+Purpose:
+
+- Avoid repeated QPL job init/allocation on the foreground path.
+- Compare `BTREE_QPL_JOB_CACHE=thread` against `pool` if Intel sees unexpected regressions.
+
+Acceptance:
+
+- QPL rows should show `qpl_tls_jobs>0` and `qpl_pool_jobs=0` in the default configuration.
+- LZ4 rows should show all QPL counters as zero.
+- QPL hardware/software selection remains external to B+Tree except for the existing `BTREE_QPL_PATH` test knob.
+
+### P9.2 zlib Stream Reuse
+
+Status: implemented behind `BTREE_ZLIB_STREAM_CACHE=thread`, default off.
+
+Purpose:
+
+- Avoid repeated zlib stream setup if Intel zlib-accel benefits from stream API reuse.
+- Keep `none` as default until Intel validates that `thread` is faster with zlib-accel preload.
+
+Acceptance:
+
+- zlib rows should show `zlib_stream_reuses>0` and `zlib_errors=0` when enabled.
+- LZ4 and QPL rows should show zlib counters as zero.
+
+### P9.3 QPL/zlib-Only Background Compaction
+
+Status: implemented with `BTREE_BG_CODEC`.
+
+Purpose:
+
+- Let foreground writes append to landing buffers.
+- Move expensive QPL/zlib compaction work into background workers.
+- Avoid perturbing LZ4 unless explicitly requested.
+
+Acceptance:
+
+- `BTREE_BG_CODEC=qpl` should only enqueue/compact QPL leaves.
+- `BTREE_BG_CODEC=zlib_accel` should only enqueue/compact zlib leaves.
+- `BTREE_BG_CODEC=all` preserves old behavior.
+- QPL/zlib write p99/p999 should improve or QPS should increase on IAA machines when background compaction is tuned correctly.
+
+### P9.4 Landing Buffer And Background Sweep
+
+Status: implemented in `run_iaa_eval.sh`.
+
+Purpose:
+
+- Find the practical throughput/latency point for IAA by sweeping landing buffer size and background on/off.
+- The most important knobs are `LANDING_LIST`, `RUN_BG_SWEEP`, `BTREE_BG_CODEC`, `BTREE_BG_THREADS`, and `BTREE_BG_LANDING_HIGH_WATERMARK_PCT`.
+
+Acceptance:
+
+- `summary.tsv` must include landing bytes, background config, throughput, latency, correctness, compression ratio, and codec API counters.
+- No manual log parsing is required.
+
+### P9.5 Host CPU Offload Measurement
+
+Status: implemented in `run_iaa_eval.sh`.
+
+Purpose:
+
+- Show whether QPL/zlib-accel on IAA reduces host CPU usage, even when throughput is similar to LZ4.
+- Make the IAA claim stronger than throughput-only: lower `cpu_cores` or higher `qps_per_cpu_core` is a useful offload result.
+
+Acceptance:
+
+- Each `summary.tsv` row must represent one codec process, not a mixed LZ4/QPL/zlib process.
+- `cpu_pct=800%` should be interpreted as roughly eight host logical CPUs consumed during the timed workload window.
+- `cpu_cores` and `qps_per_cpu_core` must be available for direct comparison.
+- Hardware IAA rows should ideally show either higher QPS/lower latency than software rows or lower host CPU cores at comparable QPS.
+
+### P9.6 Intel IAA Sprint Matrix
+
+After Intel configures IAA outside this repo, use this as the primary matrix:
+
+```bash
+RUN_IAA=1 \
+RUN_ZLIB_ACCEL=1 \
+RUN_BG_SWEEP=1 \
+ZLIB_ACCEL_SO=<zlib-accel-build>/libzlib_accel.so \
+THREADS_LIST='8 32' \
+LANDING_LIST='512 1024 2048' \
+BTREE_DURATION_SEC=5 \
+BTREE_KEY_SPACE=50000 \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_BG_CODEC=qpl \
+BTREE_BG_THREADS=1 \
+BTREE_BG_LANDING_HIGH_WATERMARK_PCT=75 \
+COLLECT_CPU=1 \
+BTREE_QPL_JOB_CACHE=thread \
+BTREE_ZLIB_STREAM_CACHE=thread \
+BTREE_MEASURE_LATENCY=1 \
+BTREE_LATENCY_SAMPLES_PER_THREAD=4096 \
+DRAM-tier/tests/btree/run_iaa_eval.sh
+```
+
+If zlib-accel is the main target, rerun with:
+
+```bash
+RUN_IAA=1 \
+RUN_ZLIB_ACCEL=1 \
+RUN_BG_SWEEP=1 \
+ZLIB_ACCEL_SO=<zlib-accel-build>/libzlib_accel.so \
+THREADS_LIST='8 32' \
+LANDING_LIST='512 1024 2048' \
+BTREE_DURATION_SEC=5 \
+BTREE_KEY_SPACE=50000 \
+BTREE_USE_SILESIA=1 \
+BTREE_VALUE_BYTES=128 \
+BTREE_SHARDS=8 \
+BTREE_BG_CODEC=zlib_accel \
+BTREE_BG_THREADS=1 \
+BTREE_BG_LANDING_HIGH_WATERMARK_PCT=75 \
+COLLECT_CPU=1 \
+BTREE_QPL_JOB_CACHE=thread \
+BTREE_ZLIB_STREAM_CACHE=thread \
+DRAM-tier/tests/btree/run_iaa_eval.sh
+```
+
+Expected hardware claims:
+
+- QPL with Intel-configured IAA should beat QPL software fixed in write-heavy and mixed workloads.
+- QPL dynamic may improve compression ratio; QPS may be lower than fixed and must be reported separately.
+- zlib API with Intel zlib-accel preload should be reported only as `engine=zlib_accel_preload`; regular system zlib is not a headline comparison target.
+- LZ4 may still win read-only latency. The primary success target is write-only, R:W 5:5, and R:W 2:8.
+- If QPL/zlib-accel does not beat LZ4 on QPS, it can still be valuable if `cpu_cores` is significantly lower and `qps_per_cpu_core` is higher.
+
+### P9.7 Remaining Work
+
+Short list only:
+
+1. Run the IAA sprint matrix on Intel hardware.
+2. Pick the best landing buffer and background settings for QPL fixed, QPL dynamic, and zlib-accel.
+3. If background compaction hurts IAA, add a simple codec-op rate limit using existing `BTREE_BG_MAX_COMPACTIONS_PER_SEC`.
+4. Add a small post-processing helper if Intel wants a compact table of `QPS`, `p99`, `cpu_cores`, and `qps_per_cpu_core` from `summary.tsv`.
+5. Keep defaults conservative until Intel results prove a better default.
+
+## DRAM-Tier Optimization Backlog
+
+This backlog is broader than Phase 8 and should be prioritized based on whether the next goal is IAA promotion or paper-complete ZipCache.
+
+### D1 IAA/QPL Async Path
+
+- Replace synchronous `qpl_execute_job()` usage with an async submit/poll path where practical.
+- Reuse QPL job objects and buffers per thread.
+- Avoid repeated init/fini in hot paths.
+- Track submit latency, completion latency, and queue wait.
+
+Priority:
+
+High for IAA hardware claims.
+
+### D2 Work-Queue Distribution
+
+- Detect enabled IAA devices/work queues.
+- Assign foreground threads across available queues.
+- Keep background compaction on separate queues or throttle it aggressively.
+- Fail fast for `BTREE_QPL_PATH=hardware` if hardware queues are unavailable.
+
+Priority:
+
+High. This directly targets Intel's concern that performance regresses at higher thread counts due to queue submission contention.
+
+### D3 Adaptive Compression Bypassing
+
+- Track per-leaf hotness.
+- Keep hot leaves uncompressed or less aggressively compacted.
+- Recompress cooled-down leaves in background.
+- Add env knobs for hotness threshold and aging period.
+
+Priority:
+
+Medium-high. This is one of the paper's DRAM-tier design techniques and should reduce read/write amplification on hot pages.
+
+### D4 Locking / Read Scalability
+
+- Continue reducing tree-level lock overhead.
+- Consider safe optimistic read traversal.
+- Consider RCU-style read traversal only after leaf/node reclamation is designed.
+- Keep structural changes under conservative locks until correctness is proven.
+
+Priority:
+
+Medium. Useful for multi-thread scaling, but easy to break correctness.
+
+### D5 Landing-Buffer Policy
+
+- Make landing-buffer size adaptive per codec and workload.
+- Larger landing buffer improves QPS but reduces effective compression.
+- Smaller landing buffer improves memory savings but increases foreground/background compression pressure.
+- Track average/max landing occupancy in stats.
+
+Priority:
+
+Medium. Needed to present throughput vs memory-saving trade-off clearly.
+
+### D6 Stats Fast Path
+
+- Rebuild correct incremental stats.
+- Keep `bplus_tree_compressed_calculate_stats()` as exact validation.
+- Add tests comparing incremental stats to exact leaf walk after split/delete/reinsert/background compaction.
+
+Priority:
+
+Medium. Current exact stats are correct but expensive.
+
+### D7 Variable-Length KV Layout
+
+- Replace fixed `int key_t` and `payload[COMPRESSED_VALUE_BYTES]` with arbitrary byte keys and values.
+- Introduce a slotted leaf-page format.
+- Preserve subpage hashing and partial decompression.
+- Revisit split/range/delete semantics after layout change.
+
+Priority:
+
+Medium-low for immediate IAA evaluation, high for final ZipCache API fidelity.
+
+### D8 Production Range Scan Semantics
+
+- Audit range scan behavior under hashed subpages.
+- Ensure returned values are strictly within requested range.
+- Add concurrent range-scan correctness tests with deletes/reinserts.
+
+Priority:
+
+Medium-low for IAA point-operation promotion, higher for full B+Tree feature completeness.
 
 ## Required Correctness Tests
 

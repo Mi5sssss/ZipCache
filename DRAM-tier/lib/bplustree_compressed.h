@@ -128,6 +128,52 @@ struct bplus_tree_compressed {
     size_t total_compressed_size;       // Total compressed size
     int compression_operations;         // Number of compression operations
     int decompression_operations;       // Number of decompression operations
+
+    // Optional background landing-buffer compaction.
+    int bg_compaction_enabled;
+    int bg_thread_count;
+    pthread_t *bg_threads;
+    volatile int bg_shutdown;
+    int bg_scan_interval_us;
+    int bg_landing_high_watermark_pct;
+    int bg_max_leaves_per_pass;
+    int bg_max_compactions_per_sec;
+    int bg_trylock_only;
+    int bg_codec_filter;  // -1=all, otherwise compression_algo_t
+    pthread_mutex_t bg_scan_lock;
+    pthread_mutex_t bg_queue_lock;
+    pthread_cond_t bg_queue_cond;
+    key_t *bg_dirty_keys;
+    int bg_queue_capacity;
+    int bg_queue_head;
+    int bg_queue_tail;
+    int bg_queue_count;
+    uint64_t bg_passes;
+    uint64_t bg_compactions;
+    uint64_t bg_trylock_misses;
+    uint64_t bg_skipped;
+    uint64_t bg_errors;
+    uint64_t bg_enqueue_attempts;
+    uint64_t bg_enqueued;
+    uint64_t bg_enqueue_duplicates;
+    uint64_t bg_queue_full;
+    uint64_t bg_queue_pops;
+    uint64_t fg_landing_full;
+    uint64_t fg_sync_compactions;
+    uint64_t fg_sync_compaction_errors;
+    uint64_t fg_split_fallbacks;
+
+    // Codec API counters for QPL/zlib API-level optimization.
+    uint64_t qpl_compress_calls;
+    uint64_t qpl_decompress_calls;
+    uint64_t qpl_tls_jobs;
+    uint64_t qpl_pool_jobs;
+    uint64_t qpl_errors;
+    uint64_t zlib_compress_calls;
+    uint64_t zlib_decompress_calls;
+    uint64_t zlib_stream_reuses;
+    uint64_t zlib_stream_inits;
+    uint64_t zlib_errors;
 };
 
 /**
@@ -225,6 +271,48 @@ int bplus_tree_compressed_stats(struct bplus_tree_compressed *ct_tree,
  */
 int bplus_tree_compressed_calculate_stats(struct bplus_tree_compressed *ct_tree,
                                           size_t *total_size, size_t *compressed_size);
+
+/**
+ * Get background landing-buffer compaction counters.
+ * All output pointers are optional.
+ */
+int bplus_tree_compressed_bg_stats(struct bplus_tree_compressed *ct_tree,
+                                   uint64_t *passes,
+                                   uint64_t *compactions,
+                                   uint64_t *trylock_misses,
+                                   uint64_t *skipped,
+                                   uint64_t *errors);
+
+/**
+ * Get Phase-8 foreground/background compaction counters.
+ * All output pointers are optional.
+ */
+int bplus_tree_compressed_compaction_stats(struct bplus_tree_compressed *ct_tree,
+                                           uint64_t *fg_landing_full,
+                                           uint64_t *fg_sync_compactions,
+                                           uint64_t *fg_sync_compaction_errors,
+                                           uint64_t *fg_split_fallbacks,
+                                           uint64_t *bg_enqueue_attempts,
+                                           uint64_t *bg_enqueued,
+                                           uint64_t *bg_enqueue_duplicates,
+                                           uint64_t *bg_queue_full,
+                                           uint64_t *bg_queue_pops);
+
+/**
+ * Get codec API counters. These counters expose B+Tree-side API usage, not
+ * low-level IAA queue state. All output pointers are optional.
+ */
+int bplus_tree_compressed_codec_stats(struct bplus_tree_compressed *ct_tree,
+                                      uint64_t *qpl_compress_calls,
+                                      uint64_t *qpl_decompress_calls,
+                                      uint64_t *qpl_tls_jobs,
+                                      uint64_t *qpl_pool_jobs,
+                                      uint64_t *qpl_errors,
+                                      uint64_t *zlib_compress_calls,
+                                      uint64_t *zlib_decompress_calls,
+                                      uint64_t *zlib_stream_reuses,
+                                      uint64_t *zlib_stream_inits,
+                                      uint64_t *zlib_errors);
 
 /**
  * Initialize Intel QPL for the tree (internal function)

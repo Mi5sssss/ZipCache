@@ -34,6 +34,7 @@ struct stats_summary {
     double p50_ns;
     double p90_ns;
     double p99_ns;
+    double p999_ns;
 };
 
 struct sample_record {
@@ -469,6 +470,7 @@ static void compute_stats(const double *samples, int count, struct stats_summary
     out->p50_ns = percentile(sorted, count, 50.0);
     out->p90_ns = percentile(sorted, count, 90.0);
     out->p99_ns = percentile(sorted, count, 99.0);
+    out->p999_ns = percentile(sorted, count, 99.9);
 
     free(sorted);
 }
@@ -481,10 +483,11 @@ static void summarize_and_print(const char *label, const struct sample_record *s
     if (samples->get_count > 0) {
         struct stats_summary get_stats;
         compute_stats(samples->prefetch_ns, samples->get_count, &get_stats);
-        printf("  get : p50 %.3f  p90 %.3f  p99 %.3f  max %.3f  avg %.3f\n",
+        printf("  get : p50 %.3f  p90 %.3f  p99 %.3f  p999 %.3f  max %.3f  avg %.3f\n",
                get_stats.p50_ns * scale,
                get_stats.p90_ns * scale,
                get_stats.p99_ns * scale,
+               get_stats.p999_ns * scale,
                get_stats.max_ns * scale,
                get_stats.avg_ns * scale);
     } else {
@@ -494,10 +497,11 @@ static void summarize_and_print(const char *label, const struct sample_record *s
     if (samples->put_count > 0) {
         struct stats_summary put_stats;
         compute_stats(samples->update_ns, samples->put_count, &put_stats);
-        printf("  put : p50 %.3f  p90 %.3f  p99 %.3f  max %.3f  avg %.3f\n",
+        printf("  put : p50 %.3f  p90 %.3f  p99 %.3f  p999 %.3f  max %.3f  avg %.3f\n",
                put_stats.p50_ns * scale,
                put_stats.p90_ns * scale,
                put_stats.p99_ns * scale,
+               put_stats.p999_ns * scale,
                put_stats.max_ns * scale,
                put_stats.avg_ns * scale);
     } else {

@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <time.h>
 #include <unistd.h>
+#include <strings.h>
 #ifdef HAVE_ZLIB
 #include <zlib.h>
 #endif
@@ -29,9 +30,22 @@ int init_qpl(struct bplus_tree_compressed *ct_tree);
 static qpl_job *acquire_qpl_job(struct bplus_tree_compressed *ct_tree, int *job_index_out);
 static void release_qpl_job(struct bplus_tree_compressed *ct_tree, int job_index);
 static qpl_job *acquire_qpl_tls_job(struct bplus_tree_compressed *ct_tree, int is_compress);
+static int qpl_tls_job_cache_enabled(void);
+static int zlib_stream_cache_enabled(void);
+static int background_codec_allowed(const struct bplus_tree_compressed *ct_tree,
+                                    const struct simple_leaf_node *leaf);
 static int compressed_tree_is_sharded(const struct bplus_tree_compressed *ct_tree);
 static struct bplus_tree_compressed *compressed_tree_shard_for_key(struct bplus_tree_compressed *ct_tree,
                                                                   key_t key);
+static int compressed_leaf_landing_count(struct bplus_tree_compressed *ct_tree,
+                                         struct simple_leaf_node *leaf);
+static int compressed_leaf_flush_landing_locked(struct bplus_tree_compressed *ct_tree,
+                                                struct simple_leaf_node *leaf);
+static void background_maybe_enqueue_key(struct bplus_tree_compressed *ct_tree,
+                                         struct simple_leaf_node *leaf,
+                                         key_t key);
+static void start_background_compaction(struct bplus_tree_compressed *ct_tree);
+static void stop_background_compaction(struct bplus_tree_compressed *ct_tree);
 static int hash_key_to_sub_page(key_t key, int num_sub_pages);
 static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_tree,
                                               key_t key,
@@ -90,6 +104,8 @@ void bplus_tree_compressed_deinit(struct bplus_tree_compressed *ct_tree)
     }
     
     if (ct_tree->initialized) {
+        stop_background_compaction(ct_tree);
+
         pthread_rwlock_wrlock(&ct_tree->rwlock);
         
         cleanup_qpl(ct_tree);
@@ -114,6 +130,11 @@ void bplus_tree_compressed_deinit(struct bplus_tree_compressed *ct_tree)
         
         pthread_rwlock_unlock(&ct_tree->rwlock);
         pthread_rwlock_destroy(&ct_tree->rwlock);
+        pthread_mutex_destroy(&ct_tree->bg_scan_lock);
+        pthread_mutex_destroy(&ct_tree->bg_queue_lock);
+        pthread_cond_destroy(&ct_tree->bg_queue_cond);
+        free(ct_tree->bg_dirty_keys);
+        ct_tree->bg_dirty_keys = NULL;
         ct_tree->initialized = 0;
     }
     
@@ -303,6 +324,52 @@ static int parse_range_point_lookup_threshold(void)
     return (int)parsed;
 }
 
+static int env_int_clamped(const char *name, int default_value, int min_value, int max_value)
+{
+    const char *value = getenv(name);
+    if (!value || !*value) {
+        return default_value;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < min_value || parsed > max_value) {
+        fprintf(stderr,
+                "Invalid %s=%s; expected integer in [%d, %d], using %d\n",
+                name,
+                value,
+                min_value,
+                max_value,
+                default_value);
+        return default_value;
+    }
+    return (int)parsed;
+}
+
+static int env_bool_enabled(const char *name, int default_value)
+{
+    const char *value = getenv(name);
+    if (!value || !*value) {
+        return default_value;
+    }
+    if (strcmp(value, "1") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0 ||
+        strcasecmp(value, "on") == 0) {
+        return 1;
+    }
+    if (strcmp(value, "0") == 0 ||
+        strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "no") == 0 ||
+        strcasecmp(value, "off") == 0) {
+        return 0;
+    }
+    fprintf(stderr, "Invalid %s=%s; expected 0/1, using %d\n", name, value, default_value);
+    return default_value;
+}
+
 static int compressed_tree_is_sharded(const struct bplus_tree_compressed *ct_tree)
 {
     return ct_tree && ct_tree->shard_count > 1 && ct_tree->shards != NULL;
@@ -349,6 +416,41 @@ static int qpl_hardware_strict(const struct bplus_tree_compressed *ct_tree)
     return ct_tree &&
            ct_tree->config.algo == COMPRESS_QPL &&
            ct_tree->config.qpl_path == qpl_path_hardware;
+}
+
+static int qpl_tls_job_cache_enabled(void)
+{
+    static int cached = -1;
+    int current = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (current >= 0) {
+        return current;
+    }
+
+    const char *value = getenv("BTREE_QPL_JOB_CACHE");
+    int enabled = 1;
+    if (value && *value) {
+        if (strcasecmp(value, "thread") == 0 ||
+            strcasecmp(value, "tls") == 0 ||
+            strcmp(value, "1") == 0 ||
+            strcasecmp(value, "true") == 0 ||
+            strcasecmp(value, "on") == 0) {
+            enabled = 1;
+        } else if (strcasecmp(value, "pool") == 0 ||
+                   strcasecmp(value, "global") == 0 ||
+                   strcasecmp(value, "none") == 0 ||
+                   strcmp(value, "0") == 0 ||
+                   strcasecmp(value, "false") == 0 ||
+                   strcasecmp(value, "off") == 0) {
+            enabled = 0;
+        } else {
+            fprintf(stderr,
+                    "Invalid BTREE_QPL_JOB_CACHE=%s; use thread or pool, using thread\n",
+                    value);
+        }
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELAXED);
+    return enabled;
 }
 
 struct qpl_tls_state {
@@ -460,6 +562,9 @@ static qpl_job *acquire_qpl_tls_job(struct bplus_tree_compressed *ct_tree, int i
     if (!ct_tree || ct_tree->config.algo != COMPRESS_QPL) {
         return NULL;
     }
+    if (!qpl_tls_job_cache_enabled()) {
+        return NULL;
+    }
 
     struct qpl_tls_state *state = qpl_tls_get_state();
     if (!state) {
@@ -494,6 +599,197 @@ static void release_qpl_job(struct bplus_tree_compressed *ct_tree, int job_index
     }
     pthread_mutex_unlock(&ct_tree->qpl_pool_lock);
 }
+
+#ifdef HAVE_ZLIB
+struct zlib_tls_state {
+    z_stream deflate_stream;
+    int deflate_initialized;
+    int deflate_level;
+    z_stream inflate_stream;
+    int inflate_initialized;
+};
+
+static pthread_key_t zlib_tls_key;
+static pthread_once_t zlib_tls_once = PTHREAD_ONCE_INIT;
+static int zlib_tls_key_ready = 0;
+
+static void zlib_tls_destroy(void *ptr)
+{
+    struct zlib_tls_state *state = (struct zlib_tls_state *)ptr;
+    if (!state) {
+        return;
+    }
+    if (state->deflate_initialized) {
+        deflateEnd(&state->deflate_stream);
+    }
+    if (state->inflate_initialized) {
+        inflateEnd(&state->inflate_stream);
+    }
+    free(state);
+}
+
+static void zlib_tls_make_key(void)
+{
+    zlib_tls_key_ready = (pthread_key_create(&zlib_tls_key, zlib_tls_destroy) == 0);
+}
+
+static struct zlib_tls_state *zlib_tls_get_state(void)
+{
+    pthread_once(&zlib_tls_once, zlib_tls_make_key);
+    if (!zlib_tls_key_ready) {
+        return NULL;
+    }
+
+    struct zlib_tls_state *state = pthread_getspecific(zlib_tls_key);
+    if (state) {
+        return state;
+    }
+
+    state = calloc(1, sizeof(*state));
+    if (!state) {
+        return NULL;
+    }
+    state->deflate_level = INT_MIN;
+    if (pthread_setspecific(zlib_tls_key, state) != 0) {
+        free(state);
+        return NULL;
+    }
+    return state;
+}
+
+static int zlib_stream_cache_enabled(void)
+{
+    static int cached = -1;
+    int current = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (current >= 0) {
+        return current;
+    }
+
+    const char *value = getenv("BTREE_ZLIB_STREAM_CACHE");
+    int enabled = 0;
+    if (value && *value) {
+        enabled = (strcasecmp(value, "thread") == 0 ||
+                   strcasecmp(value, "tls") == 0 ||
+                   strcmp(value, "1") == 0 ||
+                   strcasecmp(value, "true") == 0 ||
+                   strcasecmp(value, "on") == 0);
+        if (!enabled &&
+            strcasecmp(value, "none") != 0 &&
+            strcmp(value, "0") != 0 &&
+            strcasecmp(value, "false") != 0 &&
+            strcasecmp(value, "off") != 0) {
+            fprintf(stderr,
+                    "Invalid BTREE_ZLIB_STREAM_CACHE=%s; use none or thread, using none\n",
+                    value);
+        }
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELAXED);
+    return enabled;
+}
+
+static int zlib_tls_compress(struct bplus_tree_compressed *ct_tree,
+                             const uint8_t *src,
+                             uint32_t src_size,
+                             uint8_t *dst,
+                             uint32_t dst_capacity,
+                             int level)
+{
+    struct zlib_tls_state *state = zlib_tls_get_state();
+    if (!state) {
+        return -1;
+    }
+
+    if (state->deflate_initialized && state->deflate_level != level) {
+        deflateEnd(&state->deflate_stream);
+        memset(&state->deflate_stream, 0, sizeof(state->deflate_stream));
+        state->deflate_initialized = 0;
+        state->deflate_level = INT_MIN;
+    }
+
+    if (!state->deflate_initialized) {
+        memset(&state->deflate_stream, 0, sizeof(state->deflate_stream));
+        int init_status = deflateInit(&state->deflate_stream, level);
+        if (init_status != Z_OK) {
+            return -1;
+        }
+        state->deflate_initialized = 1;
+        state->deflate_level = level;
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->zlib_stream_inits, 1, __ATOMIC_RELAXED);
+        }
+    } else if (ct_tree) {
+        __atomic_add_fetch(&ct_tree->zlib_stream_reuses, 1, __ATOMIC_RELAXED);
+    }
+
+    state->deflate_stream.next_in = (Bytef *)src;
+    state->deflate_stream.avail_in = src_size;
+    state->deflate_stream.next_out = (Bytef *)dst;
+    state->deflate_stream.avail_out = dst_capacity;
+
+    int status = deflate(&state->deflate_stream, Z_FINISH);
+    uint32_t produced = dst_capacity - state->deflate_stream.avail_out;
+    uInt remaining_in = state->deflate_stream.avail_in;
+    int reset_status = deflateReset(&state->deflate_stream);
+
+    if (status == Z_STREAM_END &&
+        reset_status == Z_OK &&
+        remaining_in == 0 &&
+        produced > 0 &&
+        produced <= dst_capacity) {
+        return (int)produced;
+    }
+    return -1;
+}
+
+static int zlib_tls_decompress(struct bplus_tree_compressed *ct_tree,
+                               const uint8_t *src,
+                               uint32_t src_size,
+                               uint8_t *dst,
+                               uint32_t dst_capacity)
+{
+    struct zlib_tls_state *state = zlib_tls_get_state();
+    if (!state) {
+        return -1;
+    }
+
+    if (!state->inflate_initialized) {
+        memset(&state->inflate_stream, 0, sizeof(state->inflate_stream));
+        int init_status = inflateInit(&state->inflate_stream);
+        if (init_status != Z_OK) {
+            return -1;
+        }
+        state->inflate_initialized = 1;
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->zlib_stream_inits, 1, __ATOMIC_RELAXED);
+        }
+    } else if (ct_tree) {
+        __atomic_add_fetch(&ct_tree->zlib_stream_reuses, 1, __ATOMIC_RELAXED);
+    }
+
+    state->inflate_stream.next_in = (Bytef *)src;
+    state->inflate_stream.avail_in = src_size;
+    state->inflate_stream.next_out = (Bytef *)dst;
+    state->inflate_stream.avail_out = dst_capacity;
+
+    int status = inflate(&state->inflate_stream, Z_FINISH);
+    uint32_t produced = dst_capacity - state->inflate_stream.avail_out;
+    int reset_status = inflateReset(&state->inflate_stream);
+
+    if (status == Z_STREAM_END &&
+        reset_status == Z_OK &&
+        produced > 0 &&
+        produced <= dst_capacity) {
+        return (int)produced;
+    }
+    return -1;
+}
+#else
+static int zlib_stream_cache_enabled(void)
+{
+    return 0;
+}
+#endif
 
 static bool subpage_needed_for_range(key_t min_key, key_t max_key, int bucket, int num_subpages)
 {
@@ -530,8 +826,12 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
                             uint32_t dst_capacity)
 {
     if (leaf->compression_algo == COMPRESS_QPL) {
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->qpl_compress_calls, 1, __ATOMIC_RELAXED);
+        }
         qpl_job *tls_job = acquire_qpl_tls_job(ct_tree, 1);
         if (tls_job) {
+            __atomic_add_fetch(&ct_tree->qpl_tls_jobs, 1, __ATOMIC_RELAXED);
             tls_job->op = qpl_op_compress;
             tls_job->next_in_ptr = (uint8_t *)src;
             tls_job->available_in = src_size;
@@ -549,6 +849,7 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
             if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
                 return (int)produced;
             }
+            __atomic_add_fetch(&ct_tree->qpl_errors, 1, __ATOMIC_RELAXED);
             if (qpl_hardware_strict(ct_tree)) {
                 return -1;
             }
@@ -558,6 +859,7 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
             int job_index = -1;
             qpl_job *job = acquire_qpl_job(ct_tree, &job_index);
             if (job) {
+                __atomic_add_fetch(&ct_tree->qpl_pool_jobs, 1, __ATOMIC_RELAXED);
                 job->op = qpl_op_compress;
                 job->next_in_ptr = (uint8_t *)src;
                 job->available_in = src_size;
@@ -576,6 +878,7 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
                 if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
                     return (int)produced;
                 }
+                __atomic_add_fetch(&ct_tree->qpl_errors, 1, __ATOMIC_RELAXED);
             }
             if (qpl_hardware_strict(ct_tree)) {
                 return -1;
@@ -587,10 +890,20 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
 
 #ifdef HAVE_ZLIB
     if (leaf->compression_algo == COMPRESS_ZLIB_ACCEL) {
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->zlib_compress_calls, 1, __ATOMIC_RELAXED);
+        }
         uLongf produced = (uLongf)dst_capacity;
         int level = ct_tree->config.compression_level;
         if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) {
             level = Z_DEFAULT_COMPRESSION;
+        }
+
+        if (zlib_stream_cache_enabled()) {
+            int cached_size = zlib_tls_compress(ct_tree, src, src_size, dst, dst_capacity, level);
+            if (cached_size > 0) {
+                return cached_size;
+            }
         }
 
         int status = compress2((Bytef *)dst,
@@ -600,6 +913,9 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
                                level);
         if (status == Z_OK && produced > 0 && produced <= dst_capacity) {
             return (int)produced;
+        }
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->zlib_errors, 1, __ATOMIC_RELAXED);
         }
     }
 #endif
@@ -641,8 +957,12 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
                               uint32_t dst_capacity)
 {
     if (leaf->compression_algo == COMPRESS_QPL) {
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->qpl_decompress_calls, 1, __ATOMIC_RELAXED);
+        }
         qpl_job *tls_job = acquire_qpl_tls_job(ct_tree, 0);
         if (tls_job) {
+            __atomic_add_fetch(&ct_tree->qpl_tls_jobs, 1, __ATOMIC_RELAXED);
             tls_job->op = qpl_op_decompress;
             tls_job->next_in_ptr = (uint8_t *)src;
             tls_job->available_in = src_size;
@@ -656,6 +976,7 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
             if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
                 return (int)produced;
             }
+            __atomic_add_fetch(&ct_tree->qpl_errors, 1, __ATOMIC_RELAXED);
             if (qpl_hardware_strict(ct_tree)) {
                 return -1;
             }
@@ -665,6 +986,7 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
             int job_index = -1;
             qpl_job *job = acquire_qpl_job(ct_tree, &job_index);
             if (job) {
+                __atomic_add_fetch(&ct_tree->qpl_pool_jobs, 1, __ATOMIC_RELAXED);
                 job->op = qpl_op_decompress;
                 job->next_in_ptr = (uint8_t *)src;
                 job->available_in = src_size;
@@ -679,6 +1001,7 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
                 if (status == QPL_STS_OK && produced > 0 && produced <= dst_capacity) {
                     return (int)produced;
                 }
+                __atomic_add_fetch(&ct_tree->qpl_errors, 1, __ATOMIC_RELAXED);
             }
             if (qpl_hardware_strict(ct_tree)) {
                 return -1;
@@ -690,6 +1013,16 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
 
 #ifdef HAVE_ZLIB
     if (leaf->compression_algo == COMPRESS_ZLIB_ACCEL) {
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->zlib_decompress_calls, 1, __ATOMIC_RELAXED);
+        }
+        if (zlib_stream_cache_enabled()) {
+            int cached_size = zlib_tls_decompress(ct_tree, src, src_size, dst, dst_capacity);
+            if (cached_size > 0) {
+                return cached_size;
+            }
+        }
+
         uLongf produced = (uLongf)dst_capacity;
         int status = uncompress((Bytef *)dst,
                                 &produced,
@@ -698,10 +1031,31 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
         if (status == Z_OK && produced > 0 && produced <= dst_capacity) {
             return (int)produced;
         }
+        if (ct_tree) {
+            __atomic_add_fetch(&ct_tree->zlib_errors, 1, __ATOMIC_RELAXED);
+        }
     }
 #endif
 
     return LZ4_decompress_safe((const char *)src, (char *)dst, (int)src_size, (int)dst_capacity);
+}
+
+static int compressed_leaf_landing_count(struct bplus_tree_compressed *ct_tree,
+                                         struct simple_leaf_node *leaf)
+{
+    if (!ct_tree || !leaf) {
+        return 0;
+    }
+
+    int landing_capacity = landing_buffer_capacity_for_tree(ct_tree);
+    struct kv_pair *landing = (struct kv_pair *)leaf->landing_buffer;
+    int count = 0;
+    for (int i = 0; i < landing_capacity; i++) {
+        if (landing[i].key != 0) {
+            count++;
+        }
+    }
+    return count;
 }
 
 static int compressed_leaf_collect_pairs(struct bplus_tree_compressed *ct_tree,
@@ -961,6 +1315,167 @@ static int compressed_leaf_rebuild_with_pairs(struct bplus_tree_compressed *ct_t
     return 0;
 }
 
+static int compressed_leaf_flush_landing_locked(struct bplus_tree_compressed *ct_tree,
+                                                struct simple_leaf_node *leaf)
+{
+    if (!ct_tree || !leaf) {
+        return -1;
+    }
+    if (compressed_leaf_landing_count(ct_tree, leaf) == 0) {
+        return 0;
+    }
+
+    struct kv_pair *pairs = NULL;
+    size_t count = 0;
+    if (compressed_leaf_collect_pairs(ct_tree, leaf, &pairs, &count) != 0) {
+        free(pairs);
+        return -1;
+    }
+
+    if (count == 0) {
+        memset(leaf->landing_buffer, 0, sizeof(leaf->landing_buffer));
+        leaf->is_compressed = false;
+        leaf->compressed_size = 0;
+        leaf->compressed_bytes = 0;
+        leaf->uncompressed_bytes = 0;
+        leaf->generation++;
+        free(pairs);
+        return 0;
+    }
+
+    qsort(pairs, count, sizeof(struct kv_pair), compare_kv_pairs);
+
+    if (leaf->num_subpages <= 0) {
+        leaf->num_subpages = ct_tree->config.default_sub_pages > 0
+                                ? ct_tree->config.default_sub_pages
+                                : 1;
+    }
+
+    int sub_page_size = COMPRESSED_LEAF_SIZE / leaf->num_subpages;
+    if (sub_page_size <= 0) {
+        sub_page_size = COMPRESSED_LEAF_SIZE;
+    }
+
+    int bucket_capacity = sub_page_size / (int)sizeof(struct kv_pair);
+    if (bucket_capacity <= 0) {
+        free(pairs);
+        return -1;
+    }
+
+    char uncompressed_pages[COMPRESSED_LEAF_SIZE];
+    memset(uncompressed_pages, 0, sizeof(uncompressed_pages));
+
+    for (size_t i = 0; i < count; i++) {
+        struct kv_pair *entry = &pairs[i];
+        int bucket = positive_mod_i32(entry->key, leaf->num_subpages);
+        struct kv_pair *bucket_begin = (struct kv_pair *)(uncompressed_pages + bucket * sub_page_size);
+        bool placed = false;
+        for (int j = 0; j < bucket_capacity; j++) {
+            if (bucket_begin[j].key == 0 || bucket_begin[j].key == entry->key) {
+                bucket_begin[j] = *entry;
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            free(pairs);
+            return -1;
+        }
+    }
+
+    struct subpage_index_entry *temp_index = calloc((size_t)leaf->num_subpages, sizeof(*temp_index));
+    if (!temp_index) {
+        free(pairs);
+        return -1;
+    }
+
+    char temp_compressed[MAX_COMPRESSED_SIZE];
+    size_t running_offset = 0;
+
+    struct simple_leaf_node output_leaf;
+    memset(&output_leaf, 0, sizeof(output_leaf));
+    output_leaf.compression_algo = leaf->compression_algo;
+    output_leaf.num_subpages = leaf->num_subpages;
+
+    for (int b = 0; b < leaf->num_subpages; b++) {
+        struct kv_pair *start = (struct kv_pair *)(uncompressed_pages + b * sub_page_size);
+        bool bucket_empty = true;
+        for (int j = 0; j < bucket_capacity; j++) {
+            if (start[j].key != 0) {
+                bucket_empty = false;
+                break;
+            }
+        }
+
+        if (bucket_empty) {
+            temp_index[b].offset = (uint32_t)running_offset;
+            temp_index[b].length = 0;
+            continue;
+        }
+
+        uint32_t dest_capacity = MAX_COMPRESSED_SIZE - (uint32_t)running_offset;
+        if (dest_capacity == 0) {
+            free(temp_index);
+            free(pairs);
+            return -1;
+        }
+
+        int compressed_size = compress_subpage(ct_tree,
+                                               &output_leaf,
+                                               (const uint8_t *)start,
+                                               sub_page_size,
+                                               (uint8_t *)temp_compressed + running_offset,
+                                               dest_capacity);
+        if (compressed_size <= 0 || running_offset + (size_t)compressed_size > MAX_COMPRESSED_SIZE) {
+            free(temp_index);
+            free(pairs);
+            return -1;
+        }
+
+        temp_index[b].offset = (uint32_t)running_offset;
+        temp_index[b].length = (uint32_t)compressed_size;
+        running_offset += (size_t)compressed_size;
+    }
+
+    if (leaf->compressed_data == NULL) {
+        leaf->compressed_data = calloc(1, MAX_COMPRESSED_SIZE);
+        if (!leaf->compressed_data) {
+            free(temp_index);
+            free(pairs);
+            return -1;
+        }
+    }
+
+    if (leaf->subpage_index == NULL) {
+        leaf->subpage_index = calloc((size_t)leaf->num_subpages, sizeof(*leaf->subpage_index));
+        if (!leaf->subpage_index) {
+            free(temp_index);
+            free(pairs);
+            return -1;
+        }
+    }
+
+    memset(leaf->landing_buffer, 0, sizeof(leaf->landing_buffer));
+    memcpy(leaf->compressed_data, temp_compressed, running_offset);
+    if (running_offset < MAX_COMPRESSED_SIZE) {
+        memset(leaf->compressed_data + running_offset, 0, MAX_COMPRESSED_SIZE - running_offset);
+    }
+    memcpy(leaf->subpage_index, temp_index, (size_t)leaf->num_subpages * sizeof(*temp_index));
+
+    leaf->is_compressed = true;
+    leaf->compressed_size = (int)running_offset;
+    leaf->compressed_bytes = running_offset;
+    leaf->uncompressed_bytes = count * sizeof(struct kv_pair);
+    leaf->num_subpage_entries = leaf->num_subpages;
+    leaf->generation++;
+
+    __atomic_add_fetch(&ct_tree->compression_operations, 1, __ATOMIC_SEQ_CST);
+
+    free(temp_index);
+    free(pairs);
+    return 1;
+}
+
 static int compressed_leaf_min_key(struct bplus_tree_compressed *ct_tree,
                                    struct simple_leaf_node *leaf,
                                    key_t *out_key)
@@ -1040,6 +1555,371 @@ static void compressed_leaf_free(struct simple_leaf_node *leaf)
     free(leaf->compressed_data);
     free(leaf->subpage_index);
     free(leaf);
+}
+
+static int parse_background_codec_filter(void)
+{
+    const char *value = getenv("BTREE_BG_CODEC");
+    if (!value || !*value || strcasecmp(value, "all") == 0) {
+        return -1;
+    }
+    if (strcasecmp(value, "lz4") == 0) {
+        return COMPRESS_LZ4;
+    }
+    if (strcasecmp(value, "qpl") == 0) {
+        return COMPRESS_QPL;
+    }
+    if (strcasecmp(value, "zlib") == 0 ||
+        strcasecmp(value, "zlib_accel") == 0 ||
+        strcasecmp(value, "zlib-accel") == 0) {
+        return COMPRESS_ZLIB_ACCEL;
+    }
+
+    fprintf(stderr,
+            "Invalid BTREE_BG_CODEC=%s; use all, lz4, qpl, or zlib_accel; using all\n",
+            value);
+    return -1;
+}
+
+static int background_codec_allowed(const struct bplus_tree_compressed *ct_tree,
+                                    const struct simple_leaf_node *leaf)
+{
+    if (!ct_tree || !leaf) {
+        return 0;
+    }
+    if (ct_tree->bg_codec_filter < 0) {
+        return 1;
+    }
+    return leaf->compression_algo == (compression_algo_t)ct_tree->bg_codec_filter;
+}
+
+static void background_compaction_scan_once(struct bplus_tree_compressed *ct_tree)
+{
+    if (!ct_tree || !ct_tree->initialized || !ct_tree->tree || !ct_tree->tree->root) {
+        return;
+    }
+
+    if (pthread_mutex_trylock(&ct_tree->bg_scan_lock) != 0) {
+        __atomic_add_fetch(&ct_tree->bg_skipped, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
+    __atomic_add_fetch(&ct_tree->bg_passes, 1, __ATOMIC_RELAXED);
+
+    pthread_rwlock_rdlock(&ct_tree->rwlock);
+
+    int visited = 0;
+    int compacted_this_pass = 0;
+    int max_leaves = ct_tree->bg_max_leaves_per_pass > 0
+                       ? ct_tree->bg_max_leaves_per_pass
+                       : INT_MAX;
+    int high_pct = ct_tree->bg_landing_high_watermark_pct;
+    if (high_pct < 1) {
+        high_pct = 1;
+    } else if (high_pct > 100) {
+        high_pct = 100;
+    }
+
+    struct list_head *head = &ct_tree->tree->list[0];
+    struct list_head *pos, *n;
+    list_for_each_safe(pos, n, head) {
+        if (__atomic_load_n(&ct_tree->bg_shutdown, __ATOMIC_RELAXED)) {
+            break;
+        }
+        if (visited++ >= max_leaves) {
+            break;
+        }
+
+        struct bplus_leaf *leaf = list_entry(pos, struct bplus_leaf, link);
+        if (leaf->type != BPLUS_TREE_LEAF || leaf->data[0] == 0) {
+            continue;
+        }
+
+        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        if (!background_codec_allowed(ct_tree, custom_leaf)) {
+            continue;
+        }
+        int lock_rc = ct_tree->bg_trylock_only
+                        ? pthread_rwlock_trywrlock(&custom_leaf->rwlock)
+                        : pthread_rwlock_wrlock(&custom_leaf->rwlock);
+        if (lock_rc != 0) {
+            __atomic_add_fetch(&ct_tree->bg_trylock_misses, 1, __ATOMIC_RELAXED);
+            continue;
+        }
+
+        int landing_count = compressed_leaf_landing_count(ct_tree, custom_leaf);
+        int landing_capacity = landing_buffer_capacity_for_tree(ct_tree);
+        int should_compact = 0;
+        if (landing_count > 0 && landing_capacity > 0) {
+            should_compact = landing_count * 100 >= landing_capacity * high_pct;
+        }
+
+        if (should_compact) {
+            int rc = compressed_leaf_flush_landing_locked(ct_tree, custom_leaf);
+            if (rc > 0) {
+                __atomic_add_fetch(&ct_tree->bg_compactions, 1, __ATOMIC_RELAXED);
+                compacted_this_pass++;
+            } else if (rc < 0) {
+                __atomic_add_fetch(&ct_tree->bg_errors, 1, __ATOMIC_RELAXED);
+            }
+        }
+
+        pthread_rwlock_unlock(&custom_leaf->rwlock);
+
+        if (ct_tree->bg_max_compactions_per_sec > 0 && compacted_this_pass > 0) {
+            usleep((useconds_t)(1000000 / ct_tree->bg_max_compactions_per_sec));
+        }
+    }
+
+    pthread_rwlock_unlock(&ct_tree->rwlock);
+    pthread_mutex_unlock(&ct_tree->bg_scan_lock);
+}
+
+static int background_dirty_queue_pop(struct bplus_tree_compressed *ct_tree, key_t *key_out)
+{
+    if (!ct_tree || !key_out || !ct_tree->bg_dirty_keys || ct_tree->bg_queue_capacity <= 0) {
+        return 0;
+    }
+
+    int popped = 0;
+    pthread_mutex_lock(&ct_tree->bg_queue_lock);
+    if (ct_tree->bg_queue_count > 0) {
+        *key_out = ct_tree->bg_dirty_keys[ct_tree->bg_queue_head];
+        ct_tree->bg_queue_head = (ct_tree->bg_queue_head + 1) % ct_tree->bg_queue_capacity;
+        ct_tree->bg_queue_count--;
+        popped = 1;
+    }
+    pthread_mutex_unlock(&ct_tree->bg_queue_lock);
+
+    if (popped) {
+        __atomic_add_fetch(&ct_tree->bg_queue_pops, 1, __ATOMIC_RELAXED);
+    }
+    return popped;
+}
+
+static int background_compact_key(struct bplus_tree_compressed *ct_tree, key_t key)
+{
+    if (!ct_tree || !ct_tree->initialized || !ct_tree->tree || !ct_tree->tree->root) {
+        return 0;
+    }
+
+    pthread_rwlock_rdlock(&ct_tree->rwlock);
+
+    struct bplus_leaf *leaf = find_leaf_for_key(ct_tree->tree, key);
+    if (!leaf || leaf->type != BPLUS_TREE_LEAF || leaf->data[0] == 0) {
+        pthread_rwlock_unlock(&ct_tree->rwlock);
+        return 0;
+    }
+
+    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+    if (!background_codec_allowed(ct_tree, custom_leaf)) {
+        pthread_rwlock_unlock(&ct_tree->rwlock);
+        return 0;
+    }
+    int lock_rc = ct_tree->bg_trylock_only
+                    ? pthread_rwlock_trywrlock(&custom_leaf->rwlock)
+                    : pthread_rwlock_wrlock(&custom_leaf->rwlock);
+    if (lock_rc != 0) {
+        __atomic_add_fetch(&ct_tree->bg_trylock_misses, 1, __ATOMIC_RELAXED);
+        pthread_rwlock_unlock(&ct_tree->rwlock);
+        return 0;
+    }
+
+    int landing_count = compressed_leaf_landing_count(ct_tree, custom_leaf);
+    int landing_capacity = landing_buffer_capacity_for_tree(ct_tree);
+    int high_pct = ct_tree->bg_landing_high_watermark_pct;
+    if (high_pct < 1) {
+        high_pct = 1;
+    } else if (high_pct > 100) {
+        high_pct = 100;
+    }
+
+    int compacted = 0;
+    if (landing_count > 0 &&
+        landing_capacity > 0 &&
+        landing_count * 100 >= landing_capacity * high_pct) {
+        int rc = compressed_leaf_flush_landing_locked(ct_tree, custom_leaf);
+        if (rc > 0) {
+            __atomic_add_fetch(&ct_tree->bg_compactions, 1, __ATOMIC_RELAXED);
+            compacted = 1;
+        } else if (rc < 0) {
+            __atomic_add_fetch(&ct_tree->bg_errors, 1, __ATOMIC_RELAXED);
+        }
+    }
+
+    pthread_rwlock_unlock(&custom_leaf->rwlock);
+    pthread_rwlock_unlock(&ct_tree->rwlock);
+
+    if (ct_tree->bg_max_compactions_per_sec > 0 && compacted) {
+        usleep((useconds_t)(1000000 / ct_tree->bg_max_compactions_per_sec));
+    }
+    return compacted;
+}
+
+static void background_maybe_enqueue_key(struct bplus_tree_compressed *ct_tree,
+                                         struct simple_leaf_node *leaf,
+                                         key_t key)
+{
+    if (!ct_tree || !leaf || !ct_tree->bg_compaction_enabled ||
+        !ct_tree->bg_dirty_keys || ct_tree->bg_queue_capacity <= 0) {
+        return;
+    }
+    if (!background_codec_allowed(ct_tree, leaf)) {
+        return;
+    }
+
+    int landing_count = compressed_leaf_landing_count(ct_tree, leaf);
+    int landing_capacity = landing_buffer_capacity_for_tree(ct_tree);
+    int high_pct = ct_tree->bg_landing_high_watermark_pct;
+    if (landing_capacity <= 0 || landing_count <= 0) {
+        return;
+    }
+    if (high_pct < 1) {
+        high_pct = 1;
+    } else if (high_pct > 100) {
+        high_pct = 100;
+    }
+    if (landing_count * 100 < landing_capacity * high_pct) {
+        return;
+    }
+
+    __atomic_add_fetch(&ct_tree->bg_enqueue_attempts, 1, __ATOMIC_RELAXED);
+
+    pthread_mutex_lock(&ct_tree->bg_queue_lock);
+    for (int i = 0; i < ct_tree->bg_queue_count; i++) {
+        int idx = (ct_tree->bg_queue_head + i) % ct_tree->bg_queue_capacity;
+        if (ct_tree->bg_dirty_keys[idx] == key) {
+            __atomic_add_fetch(&ct_tree->bg_enqueue_duplicates, 1, __ATOMIC_RELAXED);
+            pthread_mutex_unlock(&ct_tree->bg_queue_lock);
+            return;
+        }
+    }
+
+    if (ct_tree->bg_queue_count >= ct_tree->bg_queue_capacity) {
+        __atomic_add_fetch(&ct_tree->bg_queue_full, 1, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&ct_tree->bg_queue_lock);
+        return;
+    }
+
+    ct_tree->bg_dirty_keys[ct_tree->bg_queue_tail] = key;
+    ct_tree->bg_queue_tail = (ct_tree->bg_queue_tail + 1) % ct_tree->bg_queue_capacity;
+    ct_tree->bg_queue_count++;
+    __atomic_add_fetch(&ct_tree->bg_enqueued, 1, __ATOMIC_RELAXED);
+    pthread_cond_signal(&ct_tree->bg_queue_cond);
+    pthread_mutex_unlock(&ct_tree->bg_queue_lock);
+}
+
+static void *background_compaction_worker(void *arg)
+{
+    struct bplus_tree_compressed *ct_tree = (struct bplus_tree_compressed *)arg;
+    while (!__atomic_load_n(&ct_tree->bg_shutdown, __ATOMIC_RELAXED)) {
+        key_t key = 0;
+        int did_work = 0;
+        while (background_dirty_queue_pop(ct_tree, &key)) {
+            did_work |= background_compact_key(ct_tree, key);
+            if (__atomic_load_n(&ct_tree->bg_shutdown, __ATOMIC_RELAXED)) {
+                break;
+            }
+        }
+        if (!did_work) {
+            background_compaction_scan_once(ct_tree);
+        }
+        int interval_us = ct_tree->bg_scan_interval_us;
+        if (interval_us <= 0) {
+            interval_us = 1000;
+        }
+        usleep((useconds_t)interval_us);
+    }
+    return NULL;
+}
+
+static void configure_background_compaction(struct bplus_tree_compressed *ct_tree)
+{
+    ct_tree->bg_compaction_enabled = env_bool_enabled("BTREE_BG_COMPACTION", 0);
+    ct_tree->bg_thread_count = env_int_clamped("BTREE_BG_THREADS", 1, 1, 64);
+    ct_tree->bg_scan_interval_us = env_int_clamped("BTREE_BG_SCAN_INTERVAL_US", 1000, 1, 10000000);
+    ct_tree->bg_landing_high_watermark_pct =
+        env_int_clamped("BTREE_BG_LANDING_HIGH_WATERMARK_PCT", 75, 1, 100);
+    ct_tree->bg_max_leaves_per_pass =
+        env_int_clamped("BTREE_BG_MAX_LEAVES_PER_PASS", 128, 1, INT_MAX);
+    ct_tree->bg_max_compactions_per_sec =
+        env_int_clamped("BTREE_BG_MAX_COMPACTIONS_PER_SEC", 0, 0, 1000000);
+    ct_tree->bg_trylock_only = env_bool_enabled("BTREE_BG_TRYLOCK_ONLY", 1);
+    ct_tree->bg_codec_filter = parse_background_codec_filter();
+    if (ct_tree->bg_compaction_enabled &&
+        ct_tree->bg_codec_filter >= 0 &&
+        ct_tree->config.algo != (compression_algo_t)ct_tree->bg_codec_filter) {
+        ct_tree->bg_compaction_enabled = 0;
+    }
+    ct_tree->bg_queue_capacity =
+        env_int_clamped("BTREE_BG_QUEUE_CAPACITY", 4096, 0, 10000000);
+}
+
+static void start_background_compaction(struct bplus_tree_compressed *ct_tree)
+{
+    if (!ct_tree || !ct_tree->bg_compaction_enabled || ct_tree->bg_thread_count <= 0) {
+        return;
+    }
+
+    if (ct_tree->bg_queue_capacity > 0) {
+        ct_tree->bg_dirty_keys = calloc((size_t)ct_tree->bg_queue_capacity, sizeof(*ct_tree->bg_dirty_keys));
+        if (!ct_tree->bg_dirty_keys) {
+            ct_tree->bg_queue_capacity = 0;
+        }
+    }
+
+    ct_tree->bg_threads = calloc((size_t)ct_tree->bg_thread_count, sizeof(*ct_tree->bg_threads));
+    if (!ct_tree->bg_threads) {
+        free(ct_tree->bg_dirty_keys);
+        ct_tree->bg_dirty_keys = NULL;
+        ct_tree->bg_compaction_enabled = 0;
+        return;
+    }
+
+    __atomic_store_n(&ct_tree->bg_shutdown, 0, __ATOMIC_RELAXED);
+    int started = 0;
+    for (int i = 0; i < ct_tree->bg_thread_count; i++) {
+        if (pthread_create(&ct_tree->bg_threads[i],
+                           NULL,
+                           background_compaction_worker,
+                           ct_tree) != 0) {
+            break;
+        }
+        started++;
+    }
+
+    if (started != ct_tree->bg_thread_count) {
+        __atomic_store_n(&ct_tree->bg_shutdown, 1, __ATOMIC_RELAXED);
+        for (int i = 0; i < started; i++) {
+            pthread_join(ct_tree->bg_threads[i], NULL);
+        }
+        free(ct_tree->bg_threads);
+        ct_tree->bg_threads = NULL;
+        free(ct_tree->bg_dirty_keys);
+        ct_tree->bg_dirty_keys = NULL;
+        ct_tree->bg_thread_count = 0;
+        ct_tree->bg_compaction_enabled = 0;
+    }
+}
+
+static void stop_background_compaction(struct bplus_tree_compressed *ct_tree)
+{
+    if (!ct_tree || !ct_tree->bg_threads || ct_tree->bg_thread_count <= 0) {
+        return;
+    }
+
+    __atomic_store_n(&ct_tree->bg_shutdown, 1, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&ct_tree->bg_queue_lock);
+    pthread_cond_broadcast(&ct_tree->bg_queue_cond);
+    pthread_mutex_unlock(&ct_tree->bg_queue_lock);
+    for (int i = 0; i < ct_tree->bg_thread_count; i++) {
+        pthread_join(ct_tree->bg_threads[i], NULL);
+    }
+    free(ct_tree->bg_threads);
+    ct_tree->bg_threads = NULL;
+    free(ct_tree->bg_dirty_keys);
+    ct_tree->bg_dirty_keys = NULL;
+    ct_tree->bg_thread_count = 0;
 }
 
 static int remove_leaf_from_parent(struct bplus_tree_compressed *ct_tree,
@@ -1292,6 +2172,7 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
                 }
             }
             leaf->generation++;
+            background_maybe_enqueue_key(ct_tree, leaf, key);
             if (trace) fprintf(stderr, "[insert] updated existing in landing\n");
             return 0;
         }
@@ -1315,9 +2196,12 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
                    sizeof(stored_value) > COMPRESSED_VALUE_BYTES ? COMPRESSED_VALUE_BYTES : sizeof(stored_value));
         }
         leaf->generation++;
+        background_maybe_enqueue_key(ct_tree, leaf, key);
         if (trace) fprintf(stderr, "[insert] placed in landing\n");
         return 0;
     }
+
+    __atomic_add_fetch(&ct_tree->fg_landing_full, 1, __ATOMIC_RELAXED);
 
     if (ct_tree->debug_mode) {
         fprintf(stderr, "LANDING BUFFER FULL: Compressing for key=%d\n", key);
@@ -1426,6 +2310,7 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
                     bucket, bucket_capacity, key);
             fflush(stderr);
         }
+        __atomic_add_fetch(&ct_tree->fg_split_fallbacks, 1, __ATOMIC_RELAXED);
         return -1;
     }
 
@@ -1476,6 +2361,7 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
         uint32_t dest_capacity = MAX_COMPRESSED_SIZE - (uint32_t)running_offset;
         if (dest_capacity == 0) {
             free(temp_index);
+            __atomic_add_fetch(&ct_tree->fg_sync_compaction_errors, 1, __ATOMIC_RELAXED);
             return -1;
         }
 
@@ -1487,6 +2373,7 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
                                                dest_capacity);
         if (compressed_size <= 0 || running_offset + (size_t)compressed_size > MAX_COMPRESSED_SIZE) {
             free(temp_index);
+            __atomic_add_fetch(&ct_tree->fg_sync_compaction_errors, 1, __ATOMIC_RELAXED);
             return -1;
         }
 
@@ -1508,6 +2395,7 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
         leaf->subpage_index = calloc(leaf->num_subpages, sizeof(struct subpage_index_entry));
         if (!leaf->subpage_index) {
             free(temp_index);
+            __atomic_add_fetch(&ct_tree->fg_sync_compaction_errors, 1, __ATOMIC_RELAXED);
             return -1;
         }
     }
@@ -1526,6 +2414,7 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
     leaf->generation++;
 
     free(temp_index);
+    __atomic_add_fetch(&ct_tree->fg_sync_compactions, 1, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -2948,6 +3837,330 @@ int bplus_tree_compressed_stats(struct bplus_tree_compressed *ct_tree,
     return bplus_tree_compressed_calculate_stats(ct_tree, total_size, compressed_size);
 }
 
+int bplus_tree_compressed_bg_stats(struct bplus_tree_compressed *ct_tree,
+                                   uint64_t *passes,
+                                   uint64_t *compactions,
+                                   uint64_t *trylock_misses,
+                                   uint64_t *skipped,
+                                   uint64_t *errors)
+{
+    if (compressed_tree_is_sharded(ct_tree)) {
+        uint64_t total_passes = 0;
+        uint64_t total_compactions = 0;
+        uint64_t total_trylock_misses = 0;
+        uint64_t total_skipped = 0;
+        uint64_t total_errors = 0;
+        for (int i = 0; i < ct_tree->shard_count; i++) {
+            uint64_t shard_passes = 0;
+            uint64_t shard_compactions = 0;
+            uint64_t shard_trylock_misses = 0;
+            uint64_t shard_skipped = 0;
+            uint64_t shard_errors = 0;
+            if (bplus_tree_compressed_bg_stats(ct_tree->shards[i],
+                                               &shard_passes,
+                                               &shard_compactions,
+                                               &shard_trylock_misses,
+                                               &shard_skipped,
+                                               &shard_errors) != 0) {
+                return -1;
+            }
+            total_passes += shard_passes;
+            total_compactions += shard_compactions;
+            total_trylock_misses += shard_trylock_misses;
+            total_skipped += shard_skipped;
+            total_errors += shard_errors;
+        }
+        if (passes) {
+            *passes = total_passes;
+        }
+        if (compactions) {
+            *compactions = total_compactions;
+        }
+        if (trylock_misses) {
+            *trylock_misses = total_trylock_misses;
+        }
+        if (skipped) {
+            *skipped = total_skipped;
+        }
+        if (errors) {
+            *errors = total_errors;
+        }
+        return 0;
+    }
+
+    if (ct_tree == NULL || !ct_tree->initialized) {
+        return -1;
+    }
+    if (passes) {
+        *passes = __atomic_load_n(&ct_tree->bg_passes, __ATOMIC_RELAXED);
+    }
+    if (compactions) {
+        *compactions = __atomic_load_n(&ct_tree->bg_compactions, __ATOMIC_RELAXED);
+    }
+    if (trylock_misses) {
+        *trylock_misses = __atomic_load_n(&ct_tree->bg_trylock_misses, __ATOMIC_RELAXED);
+    }
+    if (skipped) {
+        *skipped = __atomic_load_n(&ct_tree->bg_skipped, __ATOMIC_RELAXED);
+    }
+    if (errors) {
+        *errors = __atomic_load_n(&ct_tree->bg_errors, __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+
+int bplus_tree_compressed_compaction_stats(struct bplus_tree_compressed *ct_tree,
+                                           uint64_t *fg_landing_full,
+                                           uint64_t *fg_sync_compactions,
+                                           uint64_t *fg_sync_compaction_errors,
+                                           uint64_t *fg_split_fallbacks,
+                                           uint64_t *bg_enqueue_attempts,
+                                           uint64_t *bg_enqueued,
+                                           uint64_t *bg_enqueue_duplicates,
+                                           uint64_t *bg_queue_full,
+                                           uint64_t *bg_queue_pops)
+{
+    if (compressed_tree_is_sharded(ct_tree)) {
+        uint64_t total_fg_landing_full = 0;
+        uint64_t total_fg_sync_compactions = 0;
+        uint64_t total_fg_sync_compaction_errors = 0;
+        uint64_t total_fg_split_fallbacks = 0;
+        uint64_t total_bg_enqueue_attempts = 0;
+        uint64_t total_bg_enqueued = 0;
+        uint64_t total_bg_enqueue_duplicates = 0;
+        uint64_t total_bg_queue_full = 0;
+        uint64_t total_bg_queue_pops = 0;
+
+        for (int i = 0; i < ct_tree->shard_count; i++) {
+            uint64_t shard_fg_landing_full = 0;
+            uint64_t shard_fg_sync_compactions = 0;
+            uint64_t shard_fg_sync_compaction_errors = 0;
+            uint64_t shard_fg_split_fallbacks = 0;
+            uint64_t shard_bg_enqueue_attempts = 0;
+            uint64_t shard_bg_enqueued = 0;
+            uint64_t shard_bg_enqueue_duplicates = 0;
+            uint64_t shard_bg_queue_full = 0;
+            uint64_t shard_bg_queue_pops = 0;
+
+            if (bplus_tree_compressed_compaction_stats(ct_tree->shards[i],
+                                                       &shard_fg_landing_full,
+                                                       &shard_fg_sync_compactions,
+                                                       &shard_fg_sync_compaction_errors,
+                                                       &shard_fg_split_fallbacks,
+                                                       &shard_bg_enqueue_attempts,
+                                                       &shard_bg_enqueued,
+                                                       &shard_bg_enqueue_duplicates,
+                                                       &shard_bg_queue_full,
+                                                       &shard_bg_queue_pops) != 0) {
+                return -1;
+            }
+
+            total_fg_landing_full += shard_fg_landing_full;
+            total_fg_sync_compactions += shard_fg_sync_compactions;
+            total_fg_sync_compaction_errors += shard_fg_sync_compaction_errors;
+            total_fg_split_fallbacks += shard_fg_split_fallbacks;
+            total_bg_enqueue_attempts += shard_bg_enqueue_attempts;
+            total_bg_enqueued += shard_bg_enqueued;
+            total_bg_enqueue_duplicates += shard_bg_enqueue_duplicates;
+            total_bg_queue_full += shard_bg_queue_full;
+            total_bg_queue_pops += shard_bg_queue_pops;
+        }
+
+        if (fg_landing_full) {
+            *fg_landing_full = total_fg_landing_full;
+        }
+        if (fg_sync_compactions) {
+            *fg_sync_compactions = total_fg_sync_compactions;
+        }
+        if (fg_sync_compaction_errors) {
+            *fg_sync_compaction_errors = total_fg_sync_compaction_errors;
+        }
+        if (fg_split_fallbacks) {
+            *fg_split_fallbacks = total_fg_split_fallbacks;
+        }
+        if (bg_enqueue_attempts) {
+            *bg_enqueue_attempts = total_bg_enqueue_attempts;
+        }
+        if (bg_enqueued) {
+            *bg_enqueued = total_bg_enqueued;
+        }
+        if (bg_enqueue_duplicates) {
+            *bg_enqueue_duplicates = total_bg_enqueue_duplicates;
+        }
+        if (bg_queue_full) {
+            *bg_queue_full = total_bg_queue_full;
+        }
+        if (bg_queue_pops) {
+            *bg_queue_pops = total_bg_queue_pops;
+        }
+        return 0;
+    }
+
+    if (ct_tree == NULL || !ct_tree->initialized) {
+        return -1;
+    }
+    if (fg_landing_full) {
+        *fg_landing_full = __atomic_load_n(&ct_tree->fg_landing_full, __ATOMIC_RELAXED);
+    }
+    if (fg_sync_compactions) {
+        *fg_sync_compactions = __atomic_load_n(&ct_tree->fg_sync_compactions, __ATOMIC_RELAXED);
+    }
+    if (fg_sync_compaction_errors) {
+        *fg_sync_compaction_errors = __atomic_load_n(&ct_tree->fg_sync_compaction_errors, __ATOMIC_RELAXED);
+    }
+    if (fg_split_fallbacks) {
+        *fg_split_fallbacks = __atomic_load_n(&ct_tree->fg_split_fallbacks, __ATOMIC_RELAXED);
+    }
+    if (bg_enqueue_attempts) {
+        *bg_enqueue_attempts = __atomic_load_n(&ct_tree->bg_enqueue_attempts, __ATOMIC_RELAXED);
+    }
+    if (bg_enqueued) {
+        *bg_enqueued = __atomic_load_n(&ct_tree->bg_enqueued, __ATOMIC_RELAXED);
+    }
+    if (bg_enqueue_duplicates) {
+        *bg_enqueue_duplicates = __atomic_load_n(&ct_tree->bg_enqueue_duplicates, __ATOMIC_RELAXED);
+    }
+    if (bg_queue_full) {
+        *bg_queue_full = __atomic_load_n(&ct_tree->bg_queue_full, __ATOMIC_RELAXED);
+    }
+    if (bg_queue_pops) {
+        *bg_queue_pops = __atomic_load_n(&ct_tree->bg_queue_pops, __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+
+int bplus_tree_compressed_codec_stats(struct bplus_tree_compressed *ct_tree,
+                                      uint64_t *qpl_compress_calls,
+                                      uint64_t *qpl_decompress_calls,
+                                      uint64_t *qpl_tls_jobs,
+                                      uint64_t *qpl_pool_jobs,
+                                      uint64_t *qpl_errors,
+                                      uint64_t *zlib_compress_calls,
+                                      uint64_t *zlib_decompress_calls,
+                                      uint64_t *zlib_stream_reuses,
+                                      uint64_t *zlib_stream_inits,
+                                      uint64_t *zlib_errors)
+{
+    if (compressed_tree_is_sharded(ct_tree)) {
+        uint64_t total_qpl_compress_calls = 0;
+        uint64_t total_qpl_decompress_calls = 0;
+        uint64_t total_qpl_tls_jobs = 0;
+        uint64_t total_qpl_pool_jobs = 0;
+        uint64_t total_qpl_errors = 0;
+        uint64_t total_zlib_compress_calls = 0;
+        uint64_t total_zlib_decompress_calls = 0;
+        uint64_t total_zlib_stream_reuses = 0;
+        uint64_t total_zlib_stream_inits = 0;
+        uint64_t total_zlib_errors = 0;
+
+        for (int i = 0; i < ct_tree->shard_count; i++) {
+            uint64_t shard_qpl_compress_calls = 0;
+            uint64_t shard_qpl_decompress_calls = 0;
+            uint64_t shard_qpl_tls_jobs = 0;
+            uint64_t shard_qpl_pool_jobs = 0;
+            uint64_t shard_qpl_errors = 0;
+            uint64_t shard_zlib_compress_calls = 0;
+            uint64_t shard_zlib_decompress_calls = 0;
+            uint64_t shard_zlib_stream_reuses = 0;
+            uint64_t shard_zlib_stream_inits = 0;
+            uint64_t shard_zlib_errors = 0;
+
+            if (bplus_tree_compressed_codec_stats(ct_tree->shards[i],
+                                                  &shard_qpl_compress_calls,
+                                                  &shard_qpl_decompress_calls,
+                                                  &shard_qpl_tls_jobs,
+                                                  &shard_qpl_pool_jobs,
+                                                  &shard_qpl_errors,
+                                                  &shard_zlib_compress_calls,
+                                                  &shard_zlib_decompress_calls,
+                                                  &shard_zlib_stream_reuses,
+                                                  &shard_zlib_stream_inits,
+                                                  &shard_zlib_errors) != 0) {
+                return -1;
+            }
+
+            total_qpl_compress_calls += shard_qpl_compress_calls;
+            total_qpl_decompress_calls += shard_qpl_decompress_calls;
+            total_qpl_tls_jobs += shard_qpl_tls_jobs;
+            total_qpl_pool_jobs += shard_qpl_pool_jobs;
+            total_qpl_errors += shard_qpl_errors;
+            total_zlib_compress_calls += shard_zlib_compress_calls;
+            total_zlib_decompress_calls += shard_zlib_decompress_calls;
+            total_zlib_stream_reuses += shard_zlib_stream_reuses;
+            total_zlib_stream_inits += shard_zlib_stream_inits;
+            total_zlib_errors += shard_zlib_errors;
+        }
+
+        if (qpl_compress_calls) {
+            *qpl_compress_calls = total_qpl_compress_calls;
+        }
+        if (qpl_decompress_calls) {
+            *qpl_decompress_calls = total_qpl_decompress_calls;
+        }
+        if (qpl_tls_jobs) {
+            *qpl_tls_jobs = total_qpl_tls_jobs;
+        }
+        if (qpl_pool_jobs) {
+            *qpl_pool_jobs = total_qpl_pool_jobs;
+        }
+        if (qpl_errors) {
+            *qpl_errors = total_qpl_errors;
+        }
+        if (zlib_compress_calls) {
+            *zlib_compress_calls = total_zlib_compress_calls;
+        }
+        if (zlib_decompress_calls) {
+            *zlib_decompress_calls = total_zlib_decompress_calls;
+        }
+        if (zlib_stream_reuses) {
+            *zlib_stream_reuses = total_zlib_stream_reuses;
+        }
+        if (zlib_stream_inits) {
+            *zlib_stream_inits = total_zlib_stream_inits;
+        }
+        if (zlib_errors) {
+            *zlib_errors = total_zlib_errors;
+        }
+        return 0;
+    }
+
+    if (ct_tree == NULL || !ct_tree->initialized) {
+        return -1;
+    }
+
+    if (qpl_compress_calls) {
+        *qpl_compress_calls = __atomic_load_n(&ct_tree->qpl_compress_calls, __ATOMIC_RELAXED);
+    }
+    if (qpl_decompress_calls) {
+        *qpl_decompress_calls = __atomic_load_n(&ct_tree->qpl_decompress_calls, __ATOMIC_RELAXED);
+    }
+    if (qpl_tls_jobs) {
+        *qpl_tls_jobs = __atomic_load_n(&ct_tree->qpl_tls_jobs, __ATOMIC_RELAXED);
+    }
+    if (qpl_pool_jobs) {
+        *qpl_pool_jobs = __atomic_load_n(&ct_tree->qpl_pool_jobs, __ATOMIC_RELAXED);
+    }
+    if (qpl_errors) {
+        *qpl_errors = __atomic_load_n(&ct_tree->qpl_errors, __ATOMIC_RELAXED);
+    }
+    if (zlib_compress_calls) {
+        *zlib_compress_calls = __atomic_load_n(&ct_tree->zlib_compress_calls, __ATOMIC_RELAXED);
+    }
+    if (zlib_decompress_calls) {
+        *zlib_decompress_calls = __atomic_load_n(&ct_tree->zlib_decompress_calls, __ATOMIC_RELAXED);
+    }
+    if (zlib_stream_reuses) {
+        *zlib_stream_reuses = __atomic_load_n(&ct_tree->zlib_stream_reuses, __ATOMIC_RELAXED);
+    }
+    if (zlib_stream_inits) {
+        *zlib_stream_inits = __atomic_load_n(&ct_tree->zlib_stream_inits, __ATOMIC_RELAXED);
+    }
+    if (zlib_errors) {
+        *zlib_errors = __atomic_load_n(&ct_tree->zlib_errors, __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+
 int bplus_tree_compressed_calculate_stats(struct bplus_tree_compressed *ct_tree,
                                           size_t *total_size, size_t *compressed_size)
 {
@@ -3114,11 +4327,15 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
     }
     
     pthread_rwlock_init(&ct_tree->rwlock, NULL);
+    pthread_mutex_init(&ct_tree->bg_scan_lock, NULL);
+    pthread_mutex_init(&ct_tree->bg_queue_lock, NULL);
+    pthread_cond_init(&ct_tree->bg_queue_cond, NULL);
 
     ct_tree->initialized = 1;
     ct_tree->compression_enabled = 1;
     ct_tree->debug_mode = 0;  // Debug off by default
     ct_tree->config = effective_config;
+    configure_background_compaction(ct_tree);
 
     if (ct_tree->config.algo == COMPRESS_QPL) {
         if (init_qpl(ct_tree) != 0) {
@@ -3126,6 +4343,9 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
             if (ct_tree->config.qpl_path == qpl_path_hardware) {
                 bplus_tree_deinit(ct_tree->tree);
                 pthread_rwlock_destroy(&ct_tree->rwlock);
+                pthread_mutex_destroy(&ct_tree->bg_scan_lock);
+                pthread_mutex_destroy(&ct_tree->bg_queue_lock);
+                pthread_cond_destroy(&ct_tree->bg_queue_cond);
                 free(ct_tree);
                 return NULL;
             }
@@ -3133,6 +4353,8 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
             fprintf(stderr, "QPL initialization successful\n");
         }
     }
+
+    start_background_compaction(ct_tree);
 
     return ct_tree;
 }

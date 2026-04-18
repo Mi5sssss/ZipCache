@@ -89,7 +89,6 @@ Expected result: every command passes. For `bpt_compressed_mixed_concurrency`, e
 Performance evaluation is intentionally documented outside this product-level README. Use the dedicated evaluation document for benchmark methodology, result tables, IAA commands, zlib-accel preload usage, and CPU-efficiency interpretation:
 
 - [Codec and IAA evaluation](DRAM-tier/tests/btree/IAA_EVALUATION.md)
-- [Concurrency scaling plan and implementation notes](DRAM-tier/tests/btree/CONCURRENCY_SCALING_PLAN.md)
 - [B+Tree test inventory](DRAM-tier/tests/btree/README.md)
 - [All DRAM-tier test categories](DRAM-tier/tests/README.md)
 

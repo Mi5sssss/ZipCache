@@ -42,7 +42,13 @@ Thumbs.db
 # Performance test outputs
 *.log
 *.prof
+DRAM-tier/tests/btree/results/
 DRAM-tier/tests/btree/results/iaa_eval/
+
+# Local/internal planning notes
+DRAM-tier/tests/btree/CONCURRENCY_SCALING_PLAN.md
+DRAM-tier/tests/btree/AGENT*.md
+DRAM-tier/tests/btree/*_AGENT*.md
 
 # Temporary files
 tmp/

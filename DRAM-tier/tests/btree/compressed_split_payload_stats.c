@@ -124,6 +124,34 @@ static int decompress_bucket(struct bplus_tree_compressed *tree,
         }
     }
 
+    if (leaf->compression_algo == COMPRESS_QPL && tree->qpl_pool_size == 0) {
+        uint32_t job_size = 0;
+        if (qpl_get_job_size(tree->config.qpl_path, &job_size) == QPL_STS_OK && job_size > 0) {
+            uint8_t *job_buffer = malloc(job_size);
+            qpl_job *job = (qpl_job *)job_buffer;
+            if (job_buffer && qpl_init_job(tree->config.qpl_path, job) == QPL_STS_OK) {
+                job->op = qpl_op_decompress;
+                job->next_in_ptr = (uint8_t *)leaf->compressed_data + entry->offset;
+                job->available_in = entry->length;
+                job->total_in = 0;
+                job->next_out_ptr = dst;
+                job->available_out = (uint32_t)dst_capacity;
+                job->total_out = 0;
+                job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+                qpl_status status = qpl_execute_job(job);
+                uint32_t produced = job->total_out;
+                qpl_fini_job(job);
+                free(job_buffer);
+                if (status == QPL_STS_OK && produced > 0 &&
+                    produced <= (uint32_t)dst_capacity) {
+                    return (int)produced;
+                }
+            } else {
+                free(job_buffer);
+            }
+        }
+    }
+
 #ifdef HAVE_ZLIB
     if (leaf->compression_algo == COMPRESS_ZLIB_ACCEL) {
         uLongf produced = (uLongf)dst_capacity;
@@ -179,12 +207,12 @@ static void verify_leaf_payloads(struct bplus_tree_compressed *tree,
     struct list_head *head = &tree->tree->list[0];
     struct list_head *pos, *n;
     list_for_each_safe(pos, n, head) {
-        struct bplus_leaf *leaf = list_entry(pos, struct bplus_leaf, link);
-        if (leaf->type != 0 || leaf->data[0] == 0) {
+        struct compressed_leaf_ref *leaf = list_entry(pos, struct compressed_leaf_ref, link);
+        if (leaf->type != 0 || leaf->payload == 0) {
             continue;
         }
 
-        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
         pthread_rwlock_rdlock(&custom_leaf->rwlock);
 
         struct kv_pair_view *landing = (struct kv_pair_view *)custom_leaf->landing_buffer;
@@ -361,6 +389,8 @@ static void run_codec(compression_algo_t algo)
         }
     }
 
+    require_true(bplus_tree_compressed_drain_background(tree) == 0,
+                 "background drain failed before raw leaf verification");
     verify_leaf_payloads(tree, expected, rounds);
     validate_stats(tree);
 

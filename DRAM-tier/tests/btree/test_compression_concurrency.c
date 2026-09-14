@@ -73,6 +73,7 @@ static void *worker_thread(void *arg)
 
 static void join_or_fail(pthread_t thread, int thread_id)
 {
+#if defined(__linux__)
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += THREAD_JOIN_TIMEOUT_SEC;
@@ -89,6 +90,13 @@ static void join_or_fail(pthread_t thread, int thread_id)
         fprintf(stderr, "pthread_timedjoin_np failed for thread %d rc=%d\n", thread_id, rc);
         exit(EXIT_FAILURE);
     }
+#else
+    int rc = pthread_join(thread, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "pthread_join failed for thread %d rc=%d\n", thread_id, rc);
+        exit(EXIT_FAILURE);
+    }
+#endif
 }
 
 static void configure_codec(struct compression_config *cfg, compression_algo_t algo)

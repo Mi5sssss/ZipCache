@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 project(bplustree VERSION 2.0.0 LANGUAGES C CXX)
+enable_testing()
 
 # Set C/C++ standard
 set(CMAKE_C_STANDARD 99)
@@ -19,20 +20,21 @@ set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # Find required packages
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(LZ4 REQUIRED liblz4)
+pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
 find_package(Threads REQUIRED)
 find_package(ZLIB)
 
 if(ZLIB_FOUND)
     message(STATUS "Found zlib: ${ZLIB_VERSION}")
 else()
-    message(WARNING "zlib not found - zlib/zlib-accel backend will fall back to LZ4")
+    message(WARNING "zlib not found - zlib backend is unavailable")
 endif()
 
 # Find Intel QPL library (portable)
 # Allow users to specify via environment variable QPL_ROOT or CMAKE_PREFIX_PATH
 find_library(QPL_LIBRARY qpl
     HINTS $ENV{QPL_ROOT}/lib
+          $ENV{QPL_ROOT}/lib64
 )
 find_path(QPL_INCLUDE_DIR qpl/qpl.h
     HINTS $ENV{QPL_ROOT}/include
@@ -42,7 +44,7 @@ if(QPL_LIBRARY AND QPL_INCLUDE_DIR)
     message(STATUS "Found Intel QPL: ${QPL_LIBRARY}")
     set(QPL_FOUND TRUE)
 else()
-    message(WARNING "Intel QPL not found - compressed B+Tree will use LZ4 only")
+    message(WARNING "Intel QPL not found - strict QPL paths unavailable; auto requests explicitly select LZ4 at initialization")
     set(QPL_FOUND FALSE)
 endif()
 

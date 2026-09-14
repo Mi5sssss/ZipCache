@@ -167,6 +167,7 @@ static int now_before(const struct timespec *end)
 
 static void join_or_fail(pthread_t thread, int thread_id, int duration_sec)
 {
+#if defined(__linux__)
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += duration_sec + JOIN_GRACE_SEC;
@@ -183,6 +184,14 @@ static void join_or_fail(pthread_t thread, int thread_id, int duration_sec)
         fprintf(stderr, "pthread_timedjoin_np failed for worker %d rc=%d\n", thread_id, rc);
         exit(EXIT_FAILURE);
     }
+#else
+    (void)duration_sec;
+    int rc = pthread_join(thread, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "pthread_join failed for worker %d rc=%d\n", thread_id, rc);
+        exit(EXIT_FAILURE);
+    }
+#endif
 }
 
 static int next_value(int key, int version)
@@ -248,28 +257,6 @@ static int put_tree_value(struct bplus_tree_compressed *tree,
     return bplus_tree_compressed_put(tree, (key_t)key, value);
 }
 
-static int plausible_value_for_key(int key, int value)
-{
-    if (value == -1) {
-        return 1;
-    }
-    int base = key * 1009 + 1;
-    return value > base;
-}
-
-static int plausible_value_for_range(int lo, int hi, int value)
-{
-    if (value == -1) {
-        return 1;
-    }
-    for (int key = lo; key <= hi; key++) {
-        if (plausible_value_for_key(key, value)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static int choose_key(const struct workload_config *cfg, unsigned int *seed)
 {
     int hot_keys = (cfg->key_space * cfg->hot_pct) / 100;
@@ -307,28 +294,7 @@ static int reference_get_value(struct reference_state *ref, int key)
     return value;
 }
 
-static int reference_next_value(struct reference_state *ref, int key, int *version_out)
-{
-    pthread_mutex_t *lock = reference_lock_for_key(ref, key);
-    pthread_mutex_lock(lock);
-    int version = ++ref->versions[key];
-    int value = next_value(key, version);
-    if (version_out) {
-        *version_out = version;
-    }
-    pthread_mutex_unlock(lock);
-    return value;
-}
-
-static void reference_set_value(struct reference_state *ref, int key, int value)
-{
-    pthread_mutex_t *lock = reference_lock_for_key(ref, key);
-    pthread_mutex_lock(lock);
-    ref->values[key] = value;
-    pthread_mutex_unlock(lock);
-}
-
-static int expected_range_snapshot(struct reference_state *ref, int lo, int hi)
+static int expected_range_snapshot_unlocked(struct reference_state *ref, int lo, int hi)
 {
     if (lo > hi) {
         int tmp = lo;
@@ -338,7 +304,7 @@ static int expected_range_snapshot(struct reference_state *ref, int lo, int hi)
 
     int result = -1;
     for (int key = lo; key <= hi; key++) {
-        int value = reference_get_value(ref, key);
+        int value = ref->values[key];
         if (value != -1) {
             result = value;
         }
@@ -360,24 +326,29 @@ static void *mixed_worker(void *arg)
         }
 
         if (op < cfg->read_pct) {
-            int expected_before = reference_get_value(worker->ref, key);
+            pthread_mutex_t *lock = reference_lock_for_key(worker->ref, key);
+            pthread_mutex_lock(lock);
+            int expected = worker->ref->values[key];
             struct timespec op_start;
             struct timespec op_end;
             monotonic_now(&op_start);
             int got = bplus_tree_compressed_get(worker->tree, key);
             monotonic_now(&op_end);
+            pthread_mutex_unlock(lock);
             record_latency(&worker->latency, 0, elapsed_ns(&op_start, &op_end));
-            int expected_after = reference_get_value(worker->ref, key);
-
-            if (got != expected_before &&
-                got != expected_after &&
-                !plausible_value_for_key(key, got)) {
+            if (got != expected) {
+                if (getenv("BTREE_VERBOSE_MISMATCH")) {
+                    fprintf(stderr, "read mismatch key=%d expected=%d got=%d\n",
+                            key, expected, got);
+                }
                 worker->stats.mismatches++;
             }
             worker->stats.reads++;
         } else if (op < cfg->read_pct + cfg->write_pct) {
-            int version = 0;
-            int value = reference_next_value(worker->ref, key, &version);
+            pthread_mutex_t *lock = reference_lock_for_key(worker->ref, key);
+            pthread_mutex_lock(lock);
+            int version = ++worker->ref->versions[key];
+            int value = next_value(key, version);
 
             struct timespec op_start;
             struct timespec op_end;
@@ -387,14 +358,32 @@ static void *mixed_worker(void *arg)
             record_latency(&worker->latency, 1, elapsed_ns(&op_start, &op_end));
 
             if (put_rc == 0) {
-                reference_set_value(worker->ref, key, value);
+                worker->ref->values[key] = value;
             } else {
+                if (getenv("BTREE_VERBOSE_MISMATCH")) {
+                    fprintf(stderr, "put failure key=%d version=%d rc=%d\n",
+                            key, version, put_rc);
+                }
                 worker->stats.mismatches++;
             }
+            pthread_mutex_unlock(lock);
             worker->stats.writes++;
         } else if (op < cfg->read_pct + cfg->write_pct + cfg->delete_pct) {
-            (void)bplus_tree_compressed_delete(worker->tree, key);
-            reference_set_value(worker->ref, key, -1);
+            pthread_mutex_t *lock = reference_lock_for_key(worker->ref, key);
+            pthread_mutex_lock(lock);
+            int expected = worker->ref->values[key];
+            int delete_rc = bplus_tree_compressed_delete(worker->tree, key);
+            if ((expected == -1 && delete_rc != -1) ||
+                (expected != -1 && delete_rc != 0)) {
+                if (getenv("BTREE_VERBOSE_MISMATCH")) {
+                    fprintf(stderr, "delete mismatch key=%d expected=%d rc=%d\n",
+                            key, expected, delete_rc);
+                }
+                worker->stats.mismatches++;
+            } else {
+                worker->ref->values[key] = -1;
+            }
+            pthread_mutex_unlock(lock);
             worker->stats.deletes++;
         } else {
             int span = 1 + (rand_r(&seed) % 32);
@@ -403,14 +392,16 @@ static void *mixed_worker(void *arg)
                 hi = cfg->key_space;
             }
 
-            int expected_before = expected_range_snapshot(worker->ref, key, hi);
+            for (int i = 0; i < worker->ref->lock_count; i++) {
+                pthread_mutex_lock(&worker->ref->locks[i]);
+            }
+            int expected = expected_range_snapshot_unlocked(worker->ref, key, hi);
             int got = bplus_tree_compressed_get_range(worker->tree, key, hi);
-            int expected_after = expected_range_snapshot(worker->ref, key, hi);
-
-            if (got != expected_before &&
-                got != expected_after &&
-                !plausible_value_for_range(key, hi, got)) {
+            if (got != expected) {
                 worker->stats.mismatches++;
+            }
+            for (int i = worker->ref->lock_count - 1; i >= 0; i--) {
+                pthread_mutex_unlock(&worker->ref->locks[i]);
             }
             worker->stats.scans++;
         }
@@ -627,16 +618,17 @@ static int run_codec(compression_algo_t algo,
     double bench_cpu_pct = bench_cpu_cores * 100.0;
 
     long final_mismatches = total.mismatches;
+    if (bplus_tree_compressed_drain_background(tree) != 0) {
+        final_mismatches++;
+    }
     for (int key = 1; key <= cfg->key_space; key++) {
+        int expected = reference_get_value(&ref, key);
         int got = bplus_tree_compressed_get(tree, key);
-        /*
-         * The reference array is an oracle for runtime sanity checks, but it is
-         * not a linearizable final-state oracle: a put can complete in the tree
-         * before a concurrent delete updates the reference array, or vice versa.
-         * After the workers stop, verify that any resident value belongs to the
-         * requested key rather than requiring an exact final reference match.
-         */
-        if (!plausible_value_for_key(key, got)) {
+        if (got != expected) {
+            if (getenv("BTREE_VERBOSE_MISMATCH")) {
+                fprintf(stderr, "final mismatch key=%d expected=%d got=%d\n",
+                        key, expected, got);
+            }
             final_mismatches++;
         }
     }
@@ -701,6 +693,25 @@ static int run_codec(compression_algo_t algo,
                                             &zlib_stream_reuses,
                                             &zlib_stream_inits,
                                             &zlib_errors);
+    struct bplus_tree_scheduler_stats scheduler_stats;
+    memset(&scheduler_stats, 0, sizeof(scheduler_stats));
+    (void)bplus_tree_compressed_scheduler_stats(tree, &scheduler_stats);
+    struct bplus_tree_memory_stats memory_stats;
+    memset(&memory_stats, 0, sizeof(memory_stats));
+    (void)bplus_tree_compressed_memory_stats(tree, &memory_stats);
+    size_t resident_bytes = memory_stats.tree_metadata_bytes +
+                            memory_stats.leaf_metadata_bytes +
+                            memory_stats.compressed_usable_bytes +
+                            memory_stats.active_allocated_bytes +
+                            memory_stats.pending_allocated_bytes +
+                            memory_stats.scheduler_and_qpl_bytes;
+    double scheduler_avg_batch = scheduler_stats.batches > 0
+        ? (double)scheduler_stats.submitted_tasks / (double)scheduler_stats.batches
+        : 0.0;
+    double scheduler_avg_wait_us = scheduler_stats.submitted_tasks > 0
+        ? (double)scheduler_stats.total_queue_wait_ns /
+          (double)scheduler_stats.submitted_tasks / 1000.0
+        : 0.0;
 
     long ops = total.reads + total.writes + total.deletes + total.scans;
     printf("mixed_concurrency[%s]: ops=%ld qps=%.1f reads=%ld writes=%ld deletes=%ld scans=%ld mismatches=%ld stats=%zu/%zu ratio=%.3f saved_pct=%.2f bench_wall_sec=%.6f bench_user_sec=%.6f bench_sys_sec=%.6f bench_cpu_pct=%.2f bench_cpu_cores=%.3f bg_passes=%llu bg_compactions=%llu bg_trylock_misses=%llu bg_skipped=%llu bg_errors=%llu fg_landing_full=%llu fg_sync_compactions=%llu fg_sync_compaction_errors=%llu fg_split_fallbacks=%llu bg_enqueue_attempts=%llu bg_enqueued=%llu bg_enqueue_duplicates=%llu bg_queue_full=%llu bg_queue_pops=%llu qpl_compress_calls=%llu qpl_decompress_calls=%llu qpl_tls_jobs=%llu qpl_pool_jobs=%llu qpl_errors=%llu zlib_compress_calls=%llu zlib_decompress_calls=%llu zlib_stream_reuses=%llu zlib_stream_inits=%llu zlib_errors=%llu",
@@ -745,6 +756,28 @@ static int run_codec(compression_algo_t algo,
            (unsigned long long)zlib_stream_reuses,
            (unsigned long long)zlib_stream_inits,
            (unsigned long long)zlib_errors);
+    printf(" sched_queue_peak=%llu sched_batches=%llu sched_avg_batch=%.3f sched_submitted=%llu sched_completed=%llu sched_failed=%llu sched_retries=%llu sched_queue_full=%llu sched_sync_fallbacks=%llu sched_split_fallbacks=%llu sched_avg_wait_us=%.3f sched_max_wait_us=%.3f mem_live_kv=%zu mem_tree_meta=%zu mem_leaf_meta=%zu mem_compressed_requested=%zu mem_compressed_usable=%zu mem_active=%zu mem_pending=%zu mem_scheduler_qpl=%zu resident_bytes=%zu",
+           (unsigned long long)scheduler_stats.queue_peak,
+           (unsigned long long)scheduler_stats.batches,
+           scheduler_avg_batch,
+           (unsigned long long)scheduler_stats.submitted_tasks,
+           (unsigned long long)scheduler_stats.completed_tasks,
+           (unsigned long long)scheduler_stats.failed_tasks,
+           (unsigned long long)scheduler_stats.retry_count,
+           (unsigned long long)scheduler_stats.queue_full_fallbacks,
+           (unsigned long long)scheduler_stats.synchronous_fallbacks,
+           (unsigned long long)scheduler_stats.split_fallbacks,
+           scheduler_avg_wait_us,
+           (double)scheduler_stats.max_queue_wait_ns / 1000.0,
+           memory_stats.live_kv_bytes,
+           memory_stats.tree_metadata_bytes,
+           memory_stats.leaf_metadata_bytes,
+           memory_stats.compressed_requested_bytes,
+           memory_stats.compressed_usable_bytes,
+           memory_stats.active_allocated_bytes,
+           memory_stats.pending_allocated_bytes,
+           memory_stats.scheduler_and_qpl_bytes,
+           resident_bytes);
     if (measure_latency) {
         print_latency_summary("read", read_samples, total_read_samples);
         print_latency_summary("write", write_samples, total_write_samples);

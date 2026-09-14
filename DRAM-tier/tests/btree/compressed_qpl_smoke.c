@@ -1,10 +1,14 @@
 // Minimal DRAM-tier compressed B+Tree smoke test (QPL path)
-// Note: Implementation may fall back to LZ4 behavior if QPL is unavailable or not implemented.
+// An absent real library is unavailable, not a software-QPL pass.
 #include <assert.h>
 #include <stdio.h>
 #include "bplustree_compressed.h"
 
 int main(void) {
+#ifndef HAVE_QPL
+    puts("QPL unavailable: compatibility declarations are not a codec backend.");
+    return 77;
+#endif
     struct compression_config cfg = bplus_tree_create_default_leaf_config(LEAF_TYPE_LZ4_HASHED);
     cfg.algo = COMPRESS_QPL;            // request QPL globally
     cfg.default_sub_pages = 4;

@@ -5,8 +5,8 @@
 #include "bplustree_compressed.h"
 #include "compressed_test_utils.h"
 
-#define KEY_SPACE 256
-#define OPS       2000
+#define KEY_SPACE 1024
+#define OPS       10000
 
 static void require_true(int condition, const char *message) {
     if (!condition) {
@@ -30,25 +30,6 @@ static int expected_range_value(const int reference[KEY_SPACE + 1], int lo, int 
     return result;
 }
 
-static int range_contains_value(const int reference[KEY_SPACE + 1], int lo, int hi, int value) {
-    if (lo > hi) {
-        int tmp = lo;
-        lo = hi;
-        hi = tmp;
-    }
-
-    if (value == -1) {
-        return expected_range_value(reference, lo, hi) == -1;
-    }
-
-    for (int k = lo; k <= hi; ++k) {
-        if (reference[k] == value) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static void run_fuzz(compression_algo_t algo, const char *label) {
     struct compression_config cfg = bplus_tree_create_default_leaf_config(LEAF_TYPE_LZ4_HASHED);
     cfg.algo = algo;
@@ -64,8 +45,10 @@ static void run_fuzz(compression_algo_t algo, const char *label) {
         reference[i] = -1;
     }
 
-    srand(1337 + algo);
-    for (int op = 0; op < OPS; ++op) {
+    int base_seed = btree_env_int("BTREE_FUZZ_SEED", 1337, 0);
+    int operation_count = btree_env_int("BTREE_FUZZ_OPS", OPS, 1);
+    srand((unsigned int)(base_seed + algo));
+    for (int op = 0; op < operation_count; ++op) {
         int choice = rand() % 4;
         int key = 1 + (rand() % KEY_SPACE);
 
@@ -94,7 +77,7 @@ static void run_fuzz(compression_algo_t algo, const char *label) {
             int b = 1 + (rand() % KEY_SPACE);
             int expect = expected_range_value(reference, a, b);
             int range_val = bplus_tree_compressed_get_range(ct, a, b);
-            if (!range_contains_value(reference, a, b, range_val)) {
+            if (range_val != expect) {
                 int lo = a < b ? a : b;
                 int hi = a < b ? b : a;
                 int matching_key = -1;

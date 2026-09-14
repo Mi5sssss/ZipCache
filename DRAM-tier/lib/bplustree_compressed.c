@@ -10,10 +10,23 @@
 #include <time.h>
 #include <unistd.h>
 #include <strings.h>
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+#include <dlfcn.h>
+#endif
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #ifdef HAVE_ZLIB
 #include <zlib.h>
 #endif
+#ifdef HAVE_ZSTD
+#define ZSTD_STATIC_LINKING_ONLY
+#include <zstd.h>
+#endif
 #include "bplustree_compressed.h"
+#include "compressed_alloc_audit.h"
 
 // Node type constants (fallbacks if not provided by headers)
 #ifndef BPLUS_TREE_LEAF
@@ -23,8 +36,442 @@
 #define BPLUS_TREE_NON_LEAF 1
 #endif
 
+/* Only the common node prefix is consumed by generic tree/list code. */
+_Static_assert(offsetof(struct compressed_leaf_ref, entries) == offsetof(struct bplus_node, count),
+               "compressed leaf must retain the common node prefix");
+static struct compressed_leaf_ref *compressed_leaf_ref_new(void)
+{
+    struct compressed_leaf_ref *ref = calloc(1, sizeof(*ref));
+    if (ref) {
+        ref->type = BPLUS_TREE_LEAF;
+        ref->parent_key_idx = -1;
+        list_init(&ref->link);
+    }
+    return ref;
+}
+
+static void leaf_index_release(struct simple_leaf_node *leaf)
+{
+    if (leaf->subpage_index != &leaf->inline_index) free(leaf->subpage_index);
+    leaf->subpage_index = NULL;
+}
+
+static struct subpage_index_entry *leaf_index_allocate(struct simple_leaf_node *leaf, int count)
+{
+    if (count == 1) {
+        memset(&leaf->inline_index, 0, sizeof(leaf->inline_index));
+        return &leaf->inline_index;
+    }
+    return count > 0 ? calloc((size_t)count, sizeof(*leaf->subpage_index)) : NULL;
+}
+
+static void leaf_index_adopt(struct simple_leaf_node *leaf,
+                             struct subpage_index_entry *index, int count)
+{
+    leaf_index_release(leaf);
+    if (count == 1) {
+        leaf->inline_index = index[0];
+        free(index);
+        leaf->subpage_index = &leaf->inline_index;
+    } else {
+        leaf->subpage_index = index;
+    }
+}
+
+enum pending_task_state {
+    PENDING_TASK_QUEUED = 0,
+    PENDING_TASK_RUNNING = 1,
+    PENDING_TASK_FAILED = 2
+};
+
+struct compressed_pending_task {
+    struct bplus_tree_compressed *tree;
+    struct simple_leaf_node *leaf;
+    size_t count;
+    uint64_t token;
+    uint64_t base_version;
+    uint64_t enqueued_ns;
+    int attempts;
+    enum pending_task_state state;
+    struct kv_pair records[]; /* Three normally, four only for include-trigger. */
+};
+
+static enum pending_task_state pending_task_state_load(
+    const struct compressed_pending_task *task)
+{
+    return (enum pending_task_state)__atomic_load_n(&task->state, __ATOMIC_ACQUIRE);
+}
+
+static void pending_task_state_store(struct compressed_pending_task *task,
+                                     enum pending_task_state state)
+{
+    __atomic_store_n(&task->state, state, __ATOMIC_RELEASE);
+}
+
+struct compressed_page_image {
+    char *data;
+    size_t size;
+    size_t usable;
+    struct subpage_index_entry *index;
+    int num_subpages;
+    size_t uncompressed_bytes;
+};
+
+struct split_reservation {
+    struct bplus_non_leaf *nodes[BPLUS_MAX_LEVEL];
+    int count;
+};
+
+static void split_reservation_destroy(struct split_reservation *reserve)
+{
+    while (reserve->count) free(reserve->nodes[--reserve->count]);
+}
+
+static int split_reservation_prepare(struct bplus_tree *tree,
+                                     struct compressed_leaf_ref *leaf,
+                                     struct split_reservation *reserve)
+{
+    memset(reserve, 0, sizeof(*reserve));
+    struct bplus_non_leaf *parent = leaf->parent;
+    int needed = 0;
+    while (parent && parent->children == tree->order) {
+        needed++;
+        parent = parent->parent;
+    }
+    if (!parent) {
+        if (tree->level + 1 >= BPLUS_MAX_LEVEL) return -1;
+        needed++;
+    }
+    for (int i = 0; i < needed; i++) {
+        struct bplus_non_leaf *node = calloc(1, sizeof(*node));
+        if (!node) { split_reservation_destroy(reserve); return -1; }
+        node->type = BPLUS_TREE_NON_LEAF;
+        node->parent_key_idx = -1;
+        list_init(&node->link);
+        reserve->nodes[reserve->count++] = node;
+    }
+    return 0;
+}
+
+static struct bplus_non_leaf *split_reservation_take(struct split_reservation *reserve)
+{
+    assert(reserve && reserve->count > 0);
+    return reserve->nodes[--reserve->count];
+}
+
+/* Minimal transport-neutral submit/completion slot. Buffer ownership stays
+ * with the production batch until every accepted submission is terminal. */
+struct codec_async_slot {
+    uint8_t *next_in_ptr, *next_out_ptr;
+    uint32_t available_in, available_out, total_in, total_out, flags;
+    int op, level;
+    struct compressed_pending_task *task;
+    int accepted, terminal, result;
+    uint64_t sequence;
+};
+
+struct compaction_scheduler {
+    pthread_mutex_t lock;
+    pthread_cond_t work_available;
+    pthread_cond_t state_changed;
+    pthread_t worker;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    void *worker_stack;
+    size_t worker_stack_bytes;
+    int admission_control;
+    size_t admission_reserved, pending_byte_limit, pending_charge;
+    int split_test_mode;
+#endif
+    int started;
+    int accepting;
+    int shutdown;
+    int batch_size;
+    int queue_capacity;
+    int queue_head;
+    int queue_tail;
+    int queue_count;
+    int running_count;
+    struct compressed_pending_task **queue;
+    struct bplus_tree_compressed *root;
+
+    qpl_job **qpl_jobs;
+    uint8_t **qpl_job_buffers;
+    int qpl_job_count;
+    size_t qpl_job_bytes;
+    uint8_t *raw_workspaces;
+    uint8_t *compressed_workspaces;
+    struct codec_async_slot *codec_slots;
+    int contract_mode; /* 0=real; 1=immediate, 2=reverse, 3=busy-once, 4=error, 5=bad-length */
+    int contract_gate_open;
+    struct bplus_tree_contract_stats contract_stats;
+    uint64_t decompress_phase_ns, merge_phase_ns, compress_phase_ns, commit_phase_ns;
+    uint64_t ready_at_wait_samples;
+
+    uint64_t queue_peak;
+    uint64_t batches;
+    uint64_t submitted_tasks;
+    uint64_t completed_tasks;
+    uint64_t failed_tasks;
+    uint64_t retry_count;
+    uint64_t queue_full_fallbacks;
+    uint64_t synchronous_fallbacks;
+    uint64_t split_fallbacks;
+    uint64_t total_queue_wait_ns;
+    uint64_t max_queue_wait_ns;
+};
+
+enum submission_logical_kind {
+    SUBMISSION_LOGICAL_NONE = 0,
+    SUBMISSION_LOGICAL_READ = 1,
+    SUBMISSION_LOGICAL_WRITE = 2
+};
+
+struct submission_trace_event {
+    uint64_t timestamp_ns;
+    uint64_t thread_id;
+    uint64_t op_id;
+    uint64_t leaf_id;
+    uint32_t input_bytes;
+    uint32_t output_capacity;
+    uint8_t codec_kind;
+    uint8_t logical_kind;
+    uint8_t under_write_lock;
+};
+
+struct submission_trace_state {
+    struct submission_trace_event *events;
+    uint64_t capacity;
+    uint64_t next_index;
+    int active;
+    char *path;
+};
+
+static struct submission_trace_state submission_trace;
+static pthread_once_t submission_trace_once = PTHREAD_ONCE_INIT;
+static uint64_t submission_next_op_id;
+static __thread uint64_t submission_tls_op_id;
+static __thread int submission_tls_logical_kind;
+static __thread int submission_tls_write_critical;
+static int compaction_test_codec_failure_consumed;
+static size_t qpl_tls_live_bytes;
+static size_t zlib_live_bytes;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+static struct bplus_aggregation_stats agg_stats;
+static __thread int agg_origin = BPLUS_ORIGIN_OTHER;
+static int split_zlib_window_bits = 15;
+#define AGG_INC(field, n) __atomic_add_fetch(&agg_stats.field, (uint64_t)(n), __ATOMIC_RELAXED)
+void bplus_tree_compressed_aggregation_stats(struct bplus_aggregation_stats *out, int reset)
+{
+    uint64_t *src = (uint64_t *)&agg_stats, *dst = (uint64_t *)out;
+    for (size_t i = 0; i < sizeof(agg_stats) / sizeof(uint64_t); i++) {
+        uint64_t v = reset ? __atomic_exchange_n(src+i, 0, __ATOMIC_RELAXED)
+                           : __atomic_load_n(src+i, __ATOMIC_RELAXED);
+        if (dst) dst[i] = v;
+    }
+}
+#else
+#define AGG_INC(field, n) ((void)0)
+#endif
+
+static uint64_t submission_now_ns(void)
+{
+    struct timespec ts;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void submission_trace_dump(void)
+{
+    if (!submission_trace.path || !submission_trace.events || !submission_trace.active) {
+        return;
+    }
+
+    FILE *out = fopen(submission_trace.path, "w");
+    if (!out) {
+        fprintf(stderr, "Unable to write BTREE_SUBMISSION_TRACE=%s: %s\n",
+                submission_trace.path,
+                strerror(errno));
+        return;
+    }
+
+    uint64_t observed = __atomic_load_n(&submission_trace.next_index, __ATOMIC_ACQUIRE);
+    uint64_t stored = observed < submission_trace.capacity ? observed : submission_trace.capacity;
+    fprintf(out, "# zipcache_submission_trace_v1\n");
+    fprintf(out, "# observed_events=%llu stored_events=%llu dropped_events=%llu\n",
+            (unsigned long long)observed,
+            (unsigned long long)stored,
+            (unsigned long long)(observed - stored));
+    fprintf(out,
+            "timestamp_ns,thread_id,op_id,leaf_id,codec,input_bytes,output_capacity,logical,under_write_lock\n");
+    for (uint64_t i = 0; i < stored; i++) {
+        const struct submission_trace_event *event = &submission_trace.events[i];
+        fprintf(out,
+                "%llu,%llu,%llu,%llu,%c,%u,%u,%c,%u\n",
+                (unsigned long long)event->timestamp_ns,
+                (unsigned long long)event->thread_id,
+                (unsigned long long)event->op_id,
+                (unsigned long long)event->leaf_id,
+                event->codec_kind == 1 ? 'C' : 'D',
+                event->input_bytes,
+                event->output_capacity,
+                event->logical_kind == SUBMISSION_LOGICAL_READ ? 'R' :
+                    (event->logical_kind == SUBMISSION_LOGICAL_WRITE ? 'W' : 'B'),
+                event->under_write_lock);
+    }
+    fclose(out);
+}
+
+static void submission_trace_init(void)
+{
+    const char *path = getenv("BTREE_SUBMISSION_TRACE");
+    if (!path || !*path) {
+        return;
+    }
+
+    uint64_t capacity = 2000000ULL;
+    const char *capacity_env = getenv("BTREE_SUBMISSION_TRACE_MAX_EVENTS");
+    if (capacity_env && *capacity_env) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(capacity_env, &end, 10);
+        if (errno == 0 && end != capacity_env && *end == '\0' && parsed > 0) {
+            capacity = (uint64_t)parsed;
+        }
+    }
+
+    submission_trace.events = calloc((size_t)capacity, sizeof(*submission_trace.events));
+    if (!submission_trace.events) {
+        fprintf(stderr, "Unable to allocate submission trace for %llu events\n",
+                (unsigned long long)capacity);
+        return;
+    }
+    submission_trace.path = strdup(path);
+    if (!submission_trace.path) {
+        free(submission_trace.events);
+        submission_trace.events = NULL;
+        return;
+    }
+    submission_trace.capacity = capacity;
+    atexit(submission_trace_dump);
+}
+
+static void submission_trace_reset(void)
+{
+    pthread_once(&submission_trace_once, submission_trace_init);
+    if (!submission_trace.events) {
+        return;
+    }
+    __atomic_store_n(&submission_trace.next_index, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&submission_next_op_id, 0, __ATOMIC_RELEASE);
+    submission_trace.active = 1;
+}
+
+static void submission_trace_record(uint8_t codec_kind,
+                                    uint32_t input_bytes,
+                                    uint32_t output_capacity,
+                                    const struct simple_leaf_node *leaf)
+{
+    pthread_once(&submission_trace_once, submission_trace_init);
+    if (!submission_trace.active || !submission_trace.events) {
+        return;
+    }
+
+    uint64_t index = __atomic_fetch_add(&submission_trace.next_index, 1, __ATOMIC_RELAXED);
+    if (index >= submission_trace.capacity) {
+        return;
+    }
+
+    struct submission_trace_event *event = &submission_trace.events[index];
+    event->timestamp_ns = submission_now_ns();
+    event->thread_id = (uint64_t)(uintptr_t)pthread_self();
+    event->op_id = submission_tls_op_id;
+    event->leaf_id = (uint64_t)(uintptr_t)leaf;
+    event->input_bytes = input_bytes;
+    event->output_capacity = output_capacity;
+    event->codec_kind = codec_kind;
+    event->logical_kind = (uint8_t)submission_tls_logical_kind;
+    event->under_write_lock = submission_tls_write_critical ? 1 : 0;
+}
+
+static void submission_profile_begin_logical(struct bplus_tree_compressed *ct_tree,
+                                             enum submission_logical_kind kind)
+{
+    submission_tls_logical_kind = kind;
+    submission_tls_write_critical = 0;
+    if (!ct_tree || !ct_tree->submission_profile_enabled) {
+        submission_tls_op_id = 0;
+        return;
+    }
+
+    submission_tls_op_id = __atomic_add_fetch(&submission_next_op_id, 1, __ATOMIC_RELAXED);
+    if (kind == SUBMISSION_LOGICAL_READ) {
+        __atomic_add_fetch(&ct_tree->submission_logical_reads, 1, __ATOMIC_RELAXED);
+    } else if (kind == SUBMISSION_LOGICAL_WRITE) {
+        __atomic_add_fetch(&ct_tree->submission_logical_writes, 1, __ATOMIC_RELAXED);
+    }
+}
+
+static int submission_profile_codec_begin(struct bplus_tree_compressed *ct_tree,
+                                          int is_compress,
+                                          uint32_t input_bytes,
+                                          uint32_t output_capacity,
+                                          const struct simple_leaf_node *leaf)
+{
+    if (!ct_tree || !ct_tree->submission_profile_enabled) {
+        return 0;
+    }
+
+    if (is_compress) {
+        __atomic_add_fetch(&ct_tree->submission_compress_calls, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&ct_tree->submission_compress_input_bytes,
+                           input_bytes,
+                           __ATOMIC_RELAXED);
+    } else {
+        __atomic_add_fetch(&ct_tree->submission_decompress_calls, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&ct_tree->submission_decompress_input_bytes,
+                           input_bytes,
+                           __ATOMIC_RELAXED);
+    }
+    if (submission_tls_write_critical) {
+        __atomic_add_fetch(&ct_tree->submission_calls_under_write_lock, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&ct_tree->submission_input_bytes_under_write_lock,
+                           input_bytes,
+                           __ATOMIC_RELAXED);
+    }
+
+    uint64_t current = __atomic_add_fetch(&ct_tree->submission_current_inflight,
+                                          1,
+                                          __ATOMIC_RELAXED);
+    uint64_t peak = __atomic_load_n(&ct_tree->submission_peak_inflight, __ATOMIC_RELAXED);
+    while (current > peak &&
+           !__atomic_compare_exchange_n(&ct_tree->submission_peak_inflight,
+                                        &peak,
+                                        current,
+                                        0,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {
+    }
+
+    submission_trace_record(is_compress ? 1 : 2,
+                            input_bytes,
+                            output_capacity,
+                            leaf);
+    return 1;
+}
+
+static void submission_profile_codec_end(struct bplus_tree_compressed *ct_tree, int profiled)
+{
+    if (profiled) {
+        __atomic_sub_fetch(&ct_tree->submission_current_inflight, 1, __ATOMIC_RELAXED);
+    }
+}
+
 // Forward declarations
-static struct bplus_leaf *find_leaf_for_key(struct bplus_tree *tree, key_t key);
+static struct compressed_leaf_ref *find_leaf_for_key(struct bplus_tree *tree, key_t key);
 void cleanup_qpl(struct bplus_tree_compressed *ct_tree);
 int init_qpl(struct bplus_tree_compressed *ct_tree);
 static qpl_job *acquire_qpl_job(struct bplus_tree_compressed *ct_tree, int *job_index_out);
@@ -44,7 +491,8 @@ static int compressed_leaf_flush_landing_locked(struct bplus_tree_compressed *ct
 static void background_maybe_enqueue_key(struct bplus_tree_compressed *ct_tree,
                                          struct simple_leaf_node *leaf,
                                          key_t key);
-static void start_background_compaction(struct bplus_tree_compressed *ct_tree);
+static void __attribute__((unused)) start_background_compaction(
+    struct bplus_tree_compressed *ct_tree);
 static void stop_background_compaction(struct bplus_tree_compressed *ct_tree);
 static int hash_key_to_sub_page(key_t key, int num_sub_pages);
 static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_tree,
@@ -63,18 +511,54 @@ static int insert_into_leaf_maybe_out_of_lock(struct bplus_tree_compressed *ct_t
                                               size_t *old_uncompressed,
                                               size_t *old_compressed);
 static int split_leaf(struct bplus_tree_compressed *ct_tree,
-                      struct bplus_leaf *leaf,
-                      struct bplus_leaf **new_leaf_out,
+                      struct compressed_leaf_ref *leaf,
+                      struct compressed_leaf_ref **new_leaf_out,
                       key_t *split_key_out);
 static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int order,
                                                                         int entries,
                                                                         struct compression_config *config,
                                                                         int allow_sharding);
-static int bplus_tree_insert_internal(struct bplus_tree *tree, key_t key, struct bplus_node *left, struct bplus_node *right);
-static int ensure_custom_leaf(struct bplus_tree_compressed *ct_tree, struct bplus_leaf *leaf, struct simple_leaf_node **out_leaf);
-static int compressed_parent_node_build(struct bplus_tree *tree, struct bplus_node *left, struct bplus_node *right, key_t key, int level);
-static int compressed_non_leaf_insert(struct bplus_tree *tree, struct bplus_non_leaf *node, struct bplus_node *l_ch, struct bplus_node *r_ch, key_t key, int level);
+static int bplus_tree_insert_internal(struct bplus_tree *tree, key_t key, struct bplus_node *left, struct bplus_node *right, struct split_reservation *reserve);
+static int ensure_custom_leaf(struct bplus_tree_compressed *ct_tree, struct compressed_leaf_ref *leaf, struct simple_leaf_node **out_leaf);
+static int compressed_parent_node_build(struct bplus_tree *tree, struct bplus_node *left, struct bplus_node *right, key_t key, int level, struct split_reservation *reserve);
+static int compressed_non_leaf_insert(struct bplus_tree *tree, struct bplus_non_leaf *node, struct bplus_node *l_ch, struct bplus_node *r_ch, key_t key, int level, struct split_reservation *reserve);
 static void compressed_leaf_free(struct simple_leaf_node *leaf);
+static void kv_pair_set_value(struct kv_pair *entry,
+                              key_t key,
+                              int stored_value,
+                              const uint8_t *payload,
+                              size_t payload_len);
+static int compressed_leaf_collect_base_pairs(struct bplus_tree_compressed *ct_tree,
+                                              struct simple_leaf_node *leaf,
+                                              struct kv_pair **out_pairs,
+                                              size_t *out_count);
+static int compressed_build_base_image(struct bplus_tree_compressed *ct_tree,
+                                       struct simple_leaf_node *leaf,
+                                       struct kv_pair *pairs,
+                                       size_t count,
+                                       struct compressed_page_image *image);
+static void compressed_page_image_destroy(struct compressed_page_image *image);
+static struct compaction_scheduler *compaction_scheduler_create(
+    struct bplus_tree_compressed *root);
+static void compaction_scheduler_destroy(struct compaction_scheduler *scheduler);
+static void compaction_scheduler_attach(struct bplus_tree_compressed *tree,
+                                        struct compaction_scheduler *scheduler,
+                                        int owner);
+static int compaction_scheduler_enqueue_locked(
+    struct bplus_tree_compressed *tree,
+    struct simple_leaf_node *leaf,
+    struct compressed_pending_task *task);
+static uint64_t compaction_scheduler_wait_for_change(struct compaction_scheduler *scheduler);
+static void compaction_fail_or_retry(struct compaction_scheduler *scheduler,
+                                     struct compressed_pending_task *task);
+static int compaction_insert_locked(struct bplus_tree_compressed *ct_tree,
+                                    struct simple_leaf_node *leaf,
+                                    key_t key,
+                                    int stored_value,
+                                    const uint8_t *payload,
+                                    size_t payload_len,
+                                    int *must_wait,
+                                    int *used_sync_fallback);
 
 
 
@@ -92,7 +576,13 @@ void bplus_tree_compressed_deinit(struct bplus_tree_compressed *ct_tree)
     }
 
     if (compressed_tree_is_sharded(ct_tree)) {
+        if (ct_tree->owns_scheduler && ct_tree->scheduler) {
+            compaction_scheduler_destroy(ct_tree->scheduler);
+            ct_tree->scheduler = NULL;
+            ct_tree->owns_scheduler = 0;
+        }
         for (int i = 0; i < ct_tree->shard_count; i++) {
+            ct_tree->shards[i]->scheduler = NULL;
             bplus_tree_compressed_deinit(ct_tree->shards[i]);
         }
         free(ct_tree->shards);
@@ -104,6 +594,11 @@ void bplus_tree_compressed_deinit(struct bplus_tree_compressed *ct_tree)
     }
     
     if (ct_tree->initialized) {
+        if (ct_tree->owns_scheduler && ct_tree->scheduler) {
+            compaction_scheduler_destroy(ct_tree->scheduler);
+            ct_tree->scheduler = NULL;
+            ct_tree->owns_scheduler = 0;
+        }
         stop_background_compaction(ct_tree);
 
         pthread_rwlock_wrlock(&ct_tree->rwlock);
@@ -114,16 +609,22 @@ void bplus_tree_compressed_deinit(struct bplus_tree_compressed *ct_tree)
             struct list_head *head = &ct_tree->tree->list[0];
             struct list_head *pos, *n;
             list_for_each_safe(pos, n, head) {
-                struct bplus_leaf *leaf = list_entry(pos, struct bplus_leaf, link);
+                struct compressed_leaf_ref *leaf = list_entry(pos, struct compressed_leaf_ref, link);
                 if (leaf->type != BPLUS_TREE_LEAF) {
                     continue;
                 }
-                if (leaf->data[0] != 0) {
-                    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+                if (leaf->payload != 0) {
+                    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
                     compressed_leaf_free(custom_leaf);
-                    leaf->data[0] = 0;
+                    leaf->payload = 0;
                 }
             }
+            for (int level = 0; level <= ct_tree->tree->level; level++) {
+                list_for_each_safe(pos, n, &ct_tree->tree->list[level]) {
+                    audit_forget(list_entry(pos, struct bplus_node, link));
+                }
+            }
+            audit_forget(ct_tree->tree);
             bplus_tree_deinit(ct_tree->tree);
             ct_tree->tree = NULL;
         }
@@ -141,13 +642,62 @@ void bplus_tree_compressed_deinit(struct bplus_tree_compressed *ct_tree)
     free(ct_tree);
 }
 
-// Simplified kv-pair struct to be stored in buffers
-// Stores both the API-visible integer value and an inline payload for compression.
-struct kv_pair {
-    key_t key;
-    int stored_value;
-    uint8_t payload[COMPRESSED_VALUE_BYTES];
-};
+static size_t allocation_usable_size(const void *ptr, size_t requested)
+{
+    if (!ptr) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    (void)requested;
+    return malloc_size(ptr);
+#elif defined(__GLIBC__)
+    (void)requested;
+    return malloc_usable_size((void *)ptr);
+#else
+    return requested;
+#endif
+}
+
+static void compressed_leaf_adopt_base(struct simple_leaf_node *leaf,
+                                       char *data,
+                                       size_t length,
+                                       size_t usable)
+{
+    char *old = leaf->compressed_data;
+    leaf->compressed_data = data;
+    leaf->compressed_size = (int)length;
+    leaf->compressed_capacity = length;
+    leaf->compressed_usable = usable;
+    leaf->compressed_bytes = length;
+    leaf->is_compressed = length > 0;
+    leaf->base_version++;
+    free(old);
+}
+
+/* Build first, then atomically replace the immutable resident base under lock. */
+static int compressed_leaf_replace_base(struct simple_leaf_node *leaf,
+                                        const void *data,
+                                        size_t length)
+{
+    if (!leaf || (!data && length != 0) || length > (size_t)INT_MAX) {
+        return -1;
+    }
+
+    char *replacement = NULL;
+    if (length > 0) {
+        replacement = malloc(length);
+        if (!replacement) {
+            return -1;
+        }
+        memcpy(replacement, data, length);
+    }
+
+    compressed_leaf_adopt_base(leaf,
+                               replacement,
+                               length,
+                               allocation_usable_size(replacement, length));
+    return 0;
+}
 
 // qsort comparison function for kv_pair
 int compare_kv_pairs(const void *a, const void *b) {
@@ -214,7 +764,7 @@ static int normalize_landing_buffer_bytes(int requested)
     if (requested <= 0) {
         requested = LANDING_BUFFER_DEFAULT_BYTES;
     }
-    if (requested > LANDING_BUFFER_BYTES) {
+    if ((size_t)requested > (size_t)LANDING_BUFFER_BYTES) {
         requested = LANDING_BUFFER_BYTES;
     }
     int slot_size = (int)sizeof(struct kv_pair);
@@ -255,9 +805,9 @@ static void apply_landing_buffer_env(struct compression_config *config)
             config->buffer_size = (int)parsed;
         } else {
             fprintf(stderr,
-                    "Invalid BTREE_LANDING_BUFFER_BYTES=%s; using default %d\n",
+                    "Invalid BTREE_LANDING_BUFFER_BYTES=%s; using default %zu\n",
                     value,
-                    LANDING_BUFFER_DEFAULT_BYTES);
+                    (size_t)LANDING_BUFFER_DEFAULT_BYTES);
             config->buffer_size = LANDING_BUFFER_DEFAULT_BYTES;
         }
     }
@@ -456,17 +1006,25 @@ static int qpl_tls_job_cache_enabled(void)
 struct qpl_tls_state {
     qpl_job *compress_job;
     uint8_t *compress_buffer;
+    size_t compress_bytes;
     qpl_path_t compress_path;
     qpl_job *decompress_job;
     uint8_t *decompress_buffer;
+    size_t decompress_bytes;
     qpl_path_t decompress_path;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    qpl_job *maintenance_job;
+    uint8_t *maintenance_buffer;
+    size_t maintenance_bytes;
+    qpl_path_t maintenance_path;
+#endif
 };
 
 static pthread_key_t qpl_tls_key;
 static pthread_once_t qpl_tls_once = PTHREAD_ONCE_INIT;
 static int qpl_tls_key_ready = 0;
 
-static void qpl_tls_destroy_job(qpl_job **job, uint8_t **buffer)
+static void qpl_tls_destroy_job(qpl_job **job, uint8_t **buffer, size_t *bytes)
 {
     if (job && *job) {
         qpl_fini_job(*job);
@@ -475,6 +1033,10 @@ static void qpl_tls_destroy_job(qpl_job **job, uint8_t **buffer)
     if (buffer && *buffer) {
         free(*buffer);
         *buffer = NULL;
+    }
+    if (bytes && *bytes > 0) {
+        __atomic_sub_fetch(&qpl_tls_live_bytes, *bytes, __ATOMIC_RELAXED);
+        *bytes = 0;
     }
 }
 
@@ -485,8 +1047,17 @@ static void qpl_tls_destroy(void *ptr)
         return;
     }
 
-    qpl_tls_destroy_job(&state->compress_job, &state->compress_buffer);
-    qpl_tls_destroy_job(&state->decompress_job, &state->decompress_buffer);
+    qpl_tls_destroy_job(&state->compress_job,
+                        &state->compress_buffer,
+                        &state->compress_bytes);
+    qpl_tls_destroy_job(&state->decompress_job,
+                        &state->decompress_buffer,
+                        &state->decompress_bytes);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    qpl_tls_destroy_job(&state->maintenance_job, &state->maintenance_buffer,
+                        &state->maintenance_bytes);
+#endif
+    __atomic_sub_fetch(&qpl_tls_live_bytes, allocation_usable_size(state, sizeof(*state)), __ATOMIC_RELAXED);
     free(state);
 }
 
@@ -519,11 +1090,14 @@ static struct qpl_tls_state *qpl_tls_get_state(void)
         return NULL;
     }
 
+    __atomic_add_fetch(&qpl_tls_live_bytes, allocation_usable_size(state, sizeof(*state)), __ATOMIC_RELAXED);
+
     return state;
 }
 
 static qpl_job *qpl_tls_prepare_job(qpl_job **job,
                                     uint8_t **buffer,
+                                    size_t *bytes,
                                     qpl_path_t *initialized_path,
                                     qpl_path_t requested_path)
 {
@@ -531,7 +1105,7 @@ static qpl_job *qpl_tls_prepare_job(qpl_job **job,
         return *job;
     }
 
-    qpl_tls_destroy_job(job, buffer);
+    qpl_tls_destroy_job(job, buffer, bytes);
 
     uint32_t job_size = 0;
     qpl_status status = qpl_get_job_size(requested_path, &job_size);
@@ -553,6 +1127,8 @@ static qpl_job *qpl_tls_prepare_job(qpl_job **job,
         return NULL;
     }
 
+    *bytes = allocation_usable_size(*buffer, job_size);
+    __atomic_add_fetch(&qpl_tls_live_bytes, *bytes, __ATOMIC_RELAXED);
     *initialized_path = requested_path;
     return *job;
 }
@@ -572,15 +1148,28 @@ static qpl_job *acquire_qpl_tls_job(struct bplus_tree_compressed *ct_tree, int i
     }
 
     qpl_path_t path = ct_tree->config.qpl_path;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    if (ct_tree->split_routes_enabled) {
+        int role = is_compress ? 0 : agg_origin == BPLUS_ORIGIN_GET ? 1 : 2;
+        path = ct_tree->split_routes[role];
+        /* Reuse the read job when both decoding routes are identical. */
+        if (role == 2 && path != ct_tree->split_routes[1])
+            return qpl_tls_prepare_job(&state->maintenance_job,
+                &state->maintenance_buffer, &state->maintenance_bytes,
+                &state->maintenance_path, path);
+    }
+#endif
     if (is_compress) {
         return qpl_tls_prepare_job(&state->compress_job,
                                    &state->compress_buffer,
+                                   &state->compress_bytes,
                                    &state->compress_path,
                                    path);
     }
 
     return qpl_tls_prepare_job(&state->decompress_job,
                                &state->decompress_buffer,
+                               &state->decompress_bytes,
                                &state->decompress_path,
                                path);
 }
@@ -601,6 +1190,42 @@ static void release_qpl_job(struct bplus_tree_compressed *ct_tree, int job_index
 }
 
 #ifdef HAVE_ZLIB
+static voidpf compressed_zalloc(voidpf opaque, uInt items, uInt size)
+{
+    (void)opaque;
+    void *ptr = calloc(items, size);
+    __atomic_add_fetch(&zlib_live_bytes, allocation_usable_size(ptr, (size_t)items * size), __ATOMIC_RELAXED);
+    return ptr;
+}
+static void compressed_zfree(voidpf opaque, voidpf ptr)
+{
+    (void)opaque;
+    __atomic_sub_fetch(&zlib_live_bytes, allocation_usable_size(ptr, 0), __ATOMIC_RELAXED);
+    free(ptr);
+}
+static int compressed_zlib_once(int compressing, int level, const uint8_t *src,
+                                uint32_t src_size, uint8_t *dst, uint32_t capacity)
+{
+    z_stream stream = {0};
+    stream.zalloc = compressed_zalloc;
+    stream.zfree = compressed_zfree;
+    int window = 15;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    window = split_zlib_window_bits;
+#endif
+    int status = compressing ? deflateInit2(&stream, level, Z_DEFLATED, window, 8, Z_DEFAULT_STRATEGY) : inflateInit(&stream);
+    if (status != Z_OK) return -1;
+    stream.next_in = (Bytef *)src;
+    stream.avail_in = src_size;
+    stream.next_out = dst;
+    stream.avail_out = capacity;
+    status = compressing ? deflate(&stream, Z_FINISH) : inflate(&stream, Z_FINISH);
+    int produced = (int)stream.total_out;
+    int complete = status == Z_STREAM_END && stream.avail_in == 0;
+    if (compressing) deflateEnd(&stream); else inflateEnd(&stream);
+    return complete && produced > 0 ? produced : -1;
+}
+
 struct zlib_tls_state {
     z_stream deflate_stream;
     int deflate_initialized;
@@ -625,6 +1250,7 @@ static void zlib_tls_destroy(void *ptr)
     if (state->inflate_initialized) {
         inflateEnd(&state->inflate_stream);
     }
+    __atomic_sub_fetch(&zlib_live_bytes, allocation_usable_size(state, sizeof(*state)), __ATOMIC_RELAXED);
     free(state);
 }
 
@@ -650,7 +1276,9 @@ static struct zlib_tls_state *zlib_tls_get_state(void)
         return NULL;
     }
     state->deflate_level = INT_MIN;
+    __atomic_add_fetch(&zlib_live_bytes, allocation_usable_size(state, sizeof(*state)), __ATOMIC_RELAXED);
     if (pthread_setspecific(zlib_tls_key, state) != 0) {
+        __atomic_sub_fetch(&zlib_live_bytes, allocation_usable_size(state, sizeof(*state)), __ATOMIC_RELAXED);
         free(state);
         return NULL;
     }
@@ -709,7 +1337,13 @@ static int zlib_tls_compress(struct bplus_tree_compressed *ct_tree,
 
     if (!state->deflate_initialized) {
         memset(&state->deflate_stream, 0, sizeof(state->deflate_stream));
-        int init_status = deflateInit(&state->deflate_stream, level);
+        state->deflate_stream.zalloc = compressed_zalloc;
+        state->deflate_stream.zfree = compressed_zfree;
+        int window = 15;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        window = split_zlib_window_bits;
+#endif
+        int init_status = deflateInit2(&state->deflate_stream, level, Z_DEFLATED, window, 8, Z_DEFAULT_STRATEGY);
         if (init_status != Z_OK) {
             return -1;
         }
@@ -755,6 +1389,8 @@ static int zlib_tls_decompress(struct bplus_tree_compressed *ct_tree,
 
     if (!state->inflate_initialized) {
         memset(&state->inflate_stream, 0, sizeof(state->inflate_stream));
+        state->inflate_stream.zalloc = compressed_zalloc;
+        state->inflate_stream.zfree = compressed_zfree;
         int init_status = inflateInit(&state->inflate_stream);
         if (init_status != Z_OK) {
             return -1;
@@ -791,6 +1427,28 @@ static int zlib_stream_cache_enabled(void)
 }
 #endif
 
+#include "bplustree_zstd_experiment.inc"
+void bplus_tree_compressed_release_thread_resources(void)
+{
+    if (qpl_tls_key_ready) {
+        void *state = pthread_getspecific(qpl_tls_key);
+        pthread_setspecific(qpl_tls_key, NULL);
+        qpl_tls_destroy(state);
+    }
+#ifdef HAVE_ZLIB
+    if (zlib_tls_key_ready) {
+        void *state = pthread_getspecific(zlib_tls_key);
+        pthread_setspecific(zlib_tls_key, NULL);
+        zlib_tls_destroy(state);
+    }
+#endif
+#ifdef HAVE_ZSTD
+    if (zstd_key_ready) {
+        void *state=pthread_getspecific(zstd_key); pthread_setspecific(zstd_key,NULL); zstd_destroy(state);
+    }
+#endif
+}
+
 static bool subpage_needed_for_range(key_t min_key, key_t max_key, int bucket, int num_subpages)
 {
     if (num_subpages <= 0) {
@@ -818,14 +1476,97 @@ static bool subpage_needed_for_range(key_t min_key, key_t max_key, int bucket, i
     return first_candidate <= (long long)max_key;
 }
 
-static int compress_subpage(struct bplus_tree_compressed *ct_tree,
-                            struct simple_leaf_node *leaf,
-                            const uint8_t *src,
-                            uint32_t src_size,
-                            uint8_t *dst,
-                            uint32_t dst_capacity)
+static int qpl_software_fallback_once(struct bplus_tree_compressed *ct_tree,
+                                      int is_compress,
+                                      const uint8_t *src,
+                                      uint32_t src_size,
+                                      uint8_t *dst,
+                                      uint32_t dst_capacity)
 {
+    if (!ct_tree || ct_tree->config.qpl_path != qpl_path_auto) {
+        return -1;
+    }
+
+    __atomic_add_fetch(&ct_tree->codec_fallbacks, 1, __ATOMIC_RELAXED);
+
+    uint32_t job_size = 0;
+    if (qpl_get_job_size(qpl_path_software, &job_size) != QPL_STS_OK || job_size == 0) {
+        return -1;
+    }
+    uint8_t *buffer = malloc(job_size);
+    if (!buffer) {
+        return -1;
+    }
+    qpl_job *job = (qpl_job *)buffer;
+    if (qpl_init_job(qpl_path_software, job) != QPL_STS_OK) {
+        free(buffer);
+        return -1;
+    }
+
+    job->op = is_compress ? qpl_op_compress : qpl_op_decompress;
+    job->next_in_ptr = (uint8_t *)src;
+    job->available_in = src_size;
+    job->total_in = 0;
+    job->next_out_ptr = dst;
+    job->available_out = dst_capacity;
+    job->total_out = 0;
+    job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+    if (is_compress && ct_tree->config.qpl_huffman_mode == QPL_HUFFMAN_DYNAMIC) {
+        job->flags |= QPL_FLAG_DYNAMIC_HUFFMAN;
+    }
+    job->level = qpl_default_level;
+    qpl_status status = qpl_execute_job(job);
+    uint32_t produced = job->total_out;
+    qpl_fini_job(job);
+    free(buffer);
+    return status == QPL_STS_OK && produced > 0 && produced <= dst_capacity
+        ? (int)produced : -1;
+}
+
+#include "bplustree_execution_split.inc"
+
+static int codec_compress_bytes(struct bplus_tree_compressed *ct_tree,
+                                 struct simple_leaf_node *leaf,
+                                 const uint8_t *src,
+                                 uint32_t src_size,
+                                 uint8_t *dst,
+                                 uint32_t dst_capacity)
+{
+    if (leaf->compression_algo == COMPRESS_ZSTD_EXPERIMENT) {
+#ifdef HAVE_ZSTD
+        return zstd_transform(1,src,src_size,dst,dst_capacity);
+#else
+        return -1;
+#endif
+    }
+    if (leaf->compression_algo == COMPRESS_RAW_PACKED) {
+        uint32_t used = 0;
+        for (uint32_t off = 0; off + sizeof(struct kv_pair) <= src_size;
+             off += sizeof(struct kv_pair)) {
+            key_t key;
+            memcpy(&key, src + off, sizeof(key));
+            if (!key) continue;
+            if (used + sizeof(struct kv_pair) > dst_capacity) return -1;
+            memcpy(dst + used, src + off, sizeof(struct kv_pair));
+            used += sizeof(struct kv_pair);
+        }
+        /* Explicit empty-block marker; no padded-page capacity benefit. */
+        if (!used) { if (!dst_capacity) return -1; dst[0] = 0; return 1; }
+        return (int)used;
+    }
+    if (leaf->compression_algo == COMPRESS_COPY) {
+        if (src_size == 0 || src_size > dst_capacity) {
+            return -1;
+        }
+        memcpy(dst, src, src_size);
+        return (int)src_size;
+    }
+
     if (leaf->compression_algo == COMPRESS_QPL) {
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        if (ct_tree->split_routes_enabled)
+            return split_qpl_transform(ct_tree, 1, src, src_size, dst, dst_capacity);
+#endif
         if (ct_tree) {
             __atomic_add_fetch(&ct_tree->qpl_compress_calls, 1, __ATOMIC_RELAXED);
         }
@@ -886,6 +1627,14 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
         } else if (qpl_hardware_strict(ct_tree)) {
             return -1;
         }
+
+        int software_size = qpl_software_fallback_once(ct_tree,
+                                                       1,
+                                                       src,
+                                                       src_size,
+                                                       dst,
+                                                       dst_capacity);
+        return software_size;
     }
 
 #ifdef HAVE_ZLIB
@@ -893,7 +1642,6 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
         if (ct_tree) {
             __atomic_add_fetch(&ct_tree->zlib_compress_calls, 1, __ATOMIC_RELAXED);
         }
-        uLongf produced = (uLongf)dst_capacity;
         int level = ct_tree->config.compression_level;
         if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) {
             level = Z_DEFAULT_COMPRESSION;
@@ -906,19 +1654,16 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
             }
         }
 
-        int status = compress2((Bytef *)dst,
-                               &produced,
-                               (const Bytef *)src,
-                               (uLong)src_size,
-                               level);
-        if (status == Z_OK && produced > 0 && produced <= dst_capacity) {
-            return (int)produced;
-        }
+        int produced = compressed_zlib_once(1, level, src, src_size, dst, dst_capacity);
+        if (produced > 0) return produced;
         if (ct_tree) {
             __atomic_add_fetch(&ct_tree->zlib_errors, 1, __ATOMIC_RELAXED);
         }
+        return -1;
     }
 #endif
+
+    if (leaf->compression_algo != COMPRESS_LZ4) return -1;
 
     int level = ct_tree->config.compression_level;
     if (level < 0) {
@@ -949,14 +1694,77 @@ static int compress_subpage(struct bplus_tree_compressed *ct_tree,
     return LZ4_compress_default((const char *)src, (char *)dst, (int)src_size, (int)dst_capacity);
 }
 
-static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
-                              struct simple_leaf_node *leaf,
-                              const uint8_t *src,
-                              uint32_t src_size,
-                              uint8_t *dst,
-                              uint32_t dst_capacity)
+#if ZIPCACHE_AGG_LAYOUT > 0
+static int aggregate_compress(struct bplus_tree_compressed *, struct simple_leaf_node *,
+                             const uint8_t *, uint32_t, uint8_t *, uint32_t);
+#endif
+static int compress_subpage_impl(struct bplus_tree_compressed *tree, struct simple_leaf_node *leaf,
+                                const uint8_t *src, uint32_t n, uint8_t *dst, uint32_t cap)
 {
+#if ZIPCACHE_AGG_LAYOUT > 0
+    return aggregate_compress(tree, leaf, src, n, dst, cap);
+#else
+    return codec_compress_bytes(tree, leaf, src, n, dst, cap);
+#endif
+}
+static int compress_subpage(struct bplus_tree_compressed *ct_tree,
+                            struct simple_leaf_node *leaf,
+                            const uint8_t *src,
+                            uint32_t src_size,
+                            uint8_t *dst,
+                            uint32_t dst_capacity)
+{
+    int profiled = ZIPCACHE_AGG_LAYOUT ? 0 : submission_profile_codec_begin(ct_tree,
+                                                  1,
+                                                  src_size,
+                                                  dst_capacity,
+                                                  leaf);
+    int result = compress_subpage_impl(ct_tree, leaf, src, src_size, dst, dst_capacity);
+#if defined(ZIPCACHE_AGG_EXPERIMENT) && ZIPCACHE_AGG_LAYOUT == 0
+    AGG_INC(compress[agg_origin], 1); AGG_INC(encode_bytes[agg_origin], src_size);
+#endif
+    submission_profile_codec_end(ct_tree, profiled);
+    return result;
+}
+
+static int codec_decompress_bytes(struct bplus_tree_compressed *ct_tree,
+                                   struct simple_leaf_node *leaf,
+                                   const uint8_t *src,
+                                   uint32_t src_size,
+                                   uint8_t *dst,
+                                   uint32_t dst_capacity)
+{
+    if (leaf->compression_algo == COMPRESS_ZSTD_EXPERIMENT) {
+#ifdef HAVE_ZSTD
+        return zstd_transform(0,src,src_size,dst,dst_capacity);
+#else
+        return -1;
+#endif
+    }
+    if (leaf->compression_algo == COMPRESS_RAW_PACKED) {
+        if (src_size == 1 && src[0] == 0) {
+            memset(dst, 0, dst_capacity);
+            return (int)dst_capacity;
+        }
+        if (!src_size || src_size % sizeof(struct kv_pair) || src_size > dst_capacity)
+            return -1;
+        memset(dst, 0, dst_capacity);
+        memcpy(dst, src, src_size);
+        return (int)dst_capacity;
+    }
+    if (leaf->compression_algo == COMPRESS_COPY) {
+        if (src_size == 0 || src_size > dst_capacity) {
+            return -1;
+        }
+        memcpy(dst, src, src_size);
+        return (int)src_size;
+    }
+
     if (leaf->compression_algo == COMPRESS_QPL) {
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        if (ct_tree->split_routes_enabled)
+            return split_qpl_transform(ct_tree, 0, src, src_size, dst, dst_capacity);
+#endif
         if (ct_tree) {
             __atomic_add_fetch(&ct_tree->qpl_decompress_calls, 1, __ATOMIC_RELAXED);
         }
@@ -1009,6 +1817,14 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
         } else if (qpl_hardware_strict(ct_tree)) {
             return -1;
         }
+
+        int software_size = qpl_software_fallback_once(ct_tree,
+                                                       0,
+                                                       src,
+                                                       src_size,
+                                                       dst,
+                                                       dst_capacity);
+        return software_size;
     }
 
 #ifdef HAVE_ZLIB
@@ -1023,21 +1839,50 @@ static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
             }
         }
 
-        uLongf produced = (uLongf)dst_capacity;
-        int status = uncompress((Bytef *)dst,
-                                &produced,
-                                (const Bytef *)src,
-                                (uLong)src_size);
-        if (status == Z_OK && produced > 0 && produced <= dst_capacity) {
-            return (int)produced;
-        }
+        int produced = compressed_zlib_once(0, 0, src, src_size, dst, dst_capacity);
+        if (produced > 0) return produced;
         if (ct_tree) {
             __atomic_add_fetch(&ct_tree->zlib_errors, 1, __ATOMIC_RELAXED);
         }
+        return -1;
     }
 #endif
 
+    if (leaf->compression_algo != COMPRESS_LZ4) return -1;
     return LZ4_decompress_safe((const char *)src, (char *)dst, (int)src_size, (int)dst_capacity);
+}
+
+#include "bplustree_aggregation_codec.inc"
+
+static int decompress_subpage_impl(struct bplus_tree_compressed *tree, struct simple_leaf_node *leaf,
+                                  const uint8_t *src, uint32_t n, uint8_t *dst, uint32_t cap)
+{
+#if ZIPCACHE_AGG_LAYOUT > 0
+    return aggregate_decompress(tree, leaf, src, n, dst, cap);
+#else
+    return codec_decompress_bytes(tree, leaf, src, n, dst, cap);
+#endif
+}
+static int decompress_subpage(struct bplus_tree_compressed *ct_tree,
+                              struct simple_leaf_node *leaf,
+                              const uint8_t *src,
+                              uint32_t src_size,
+                              uint8_t *dst,
+                              uint32_t dst_capacity)
+{
+    int profiled = ZIPCACHE_AGG_LAYOUT ? 0 : submission_profile_codec_begin(ct_tree,
+                                                  0,
+                                                  src_size,
+                                                  dst_capacity,
+                                                  leaf);
+    int result = decompress_subpage_impl(ct_tree, leaf, src, src_size, dst, dst_capacity);
+#if defined(ZIPCACHE_AGG_EXPERIMENT) && ZIPCACHE_AGG_LAYOUT == 0
+    AGG_INC(decompress[agg_origin], 1); AGG_INC(decode_bytes[agg_origin], dst_capacity);
+#endif
+    submission_profile_codec_end(ct_tree, profiled);
+    /* Every stored block encodes its complete logical subpage. Reject short
+     * successful decodes before readers can inspect uninitialized tail bytes. */
+    return result == (int)dst_capacity ? result : -1;
 }
 
 static int compressed_leaf_landing_count(struct bplus_tree_compressed *ct_tree,
@@ -1058,10 +1903,10 @@ static int compressed_leaf_landing_count(struct bplus_tree_compressed *ct_tree,
     return count;
 }
 
-static int compressed_leaf_collect_pairs(struct bplus_tree_compressed *ct_tree,
-                                         struct simple_leaf_node *leaf,
-                                         struct kv_pair **out_pairs,
-                                         size_t *out_count)
+static int compressed_leaf_collect_base_pairs(struct bplus_tree_compressed *ct_tree,
+                                              struct simple_leaf_node *leaf,
+                                              struct kv_pair **out_pairs,
+                                              size_t *out_count)
 {
     size_t capacity = 0;
     size_t count = 0;
@@ -1112,11 +1957,43 @@ static int compressed_leaf_collect_pairs(struct bplus_tree_compressed *ct_tree,
         }
     }
 
-    /*
-     * Landing entries are newer than the compressed image. Insert them after
-     * compressed entries so kv_vector_put overwrites stale compressed values
-     * for updated keys.
-     */
+    *out_pairs = pairs;
+    *out_count = count;
+    return 0;
+}
+
+static int compressed_leaf_collect_pairs(struct bplus_tree_compressed *ct_tree,
+                                         struct simple_leaf_node *leaf,
+                                         struct kv_pair **out_pairs,
+                                         size_t *out_count)
+{
+    struct kv_pair *pairs = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    if (compressed_leaf_collect_base_pairs(ct_tree, leaf, &pairs, &count) != 0) {
+        return -1;
+    }
+    capacity = count;
+
+    /* Pending is newer than base and older than active. */
+    if (leaf->pending) {
+        for (size_t i = 0; i < leaf->pending->count; i++) {
+            struct kv_pair *entry = &leaf->pending->records[i];
+            if (entry->key != 0 &&
+                kv_vector_put(&pairs,
+                              &count,
+                              &capacity,
+                              entry->key,
+                              entry->stored_value,
+                              entry->payload,
+                              COMPRESSED_VALUE_BYTES) != 0) {
+                free(pairs);
+                return -1;
+            }
+        }
+    }
+
+    /* Active is the newest layer and therefore overwrites pending/base. */
     int landing_capacity = landing_buffer_capacity_for_tree(ct_tree);
     struct kv_pair *landing = (struct kv_pair *)leaf->landing_buffer;
     for (int i = 0; i < landing_capacity; i++) {
@@ -1137,6 +2014,132 @@ static int compressed_leaf_collect_pairs(struct bplus_tree_compressed *ct_tree,
     *out_pairs = pairs;
     *out_count = count;
     return 0;
+}
+
+/*
+ * Build a base-only image without touching resident leaf state.  Return -2
+ * when the logical 4 KiB page cannot hold the merged key set; callers route
+ * that case to the existing structural split path.
+ */
+static int compressed_build_base_image(struct bplus_tree_compressed *ct_tree,
+                                       struct simple_leaf_node *leaf,
+                                       struct kv_pair *pairs,
+                                       size_t count,
+                                       struct compressed_page_image *image)
+{
+    if (!ct_tree || !leaf || !image) {
+        return -1;
+    }
+    memset(image, 0, sizeof(*image));
+
+    int num_subpages = leaf->num_subpages > 0
+                         ? leaf->num_subpages
+                         : (ct_tree->config.default_sub_pages > 0
+                              ? ct_tree->config.default_sub_pages
+                              : 1);
+    int sub_page_size = COMPRESSED_LEAF_SIZE / num_subpages;
+    if (sub_page_size <= 0) {
+        return -1;
+    }
+
+    struct subpage_index_entry *index = calloc((size_t)num_subpages, sizeof(*index));
+    if (!index) {
+        return -1;
+    }
+
+    if (count == 0) {
+        image->index = index;
+        image->num_subpages = num_subpages;
+        return 0;
+    }
+
+    qsort(pairs, count, sizeof(*pairs), compare_kv_pairs);
+
+    uint8_t raw[COMPRESSED_LEAF_SIZE];
+    uint8_t compressed[MAX_COMPRESSED_SIZE];
+    memset(raw, 0, sizeof(raw));
+
+    size_t bucket_capacity = (size_t)sub_page_size / sizeof(struct kv_pair);
+    for (size_t i = 0; i < count; i++) {
+        int bucket = positive_mod_i32(pairs[i].key, num_subpages);
+        struct kv_pair *slots = (struct kv_pair *)(void *)(raw + bucket * sub_page_size);
+        bool placed = false;
+        for (size_t j = 0; j < bucket_capacity; j++) {
+            if (slots[j].key == 0 || slots[j].key == pairs[i].key) {
+                slots[j] = pairs[i];
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            free(index);
+            return -2;
+        }
+    }
+
+    struct simple_leaf_node codec_leaf;
+    memset(&codec_leaf, 0, sizeof(codec_leaf));
+    codec_leaf.compression_algo = leaf->compression_algo;
+    codec_leaf.num_subpages = num_subpages;
+
+    size_t running_offset = 0;
+    for (int bucket = 0; bucket < num_subpages; bucket++) {
+        struct kv_pair *slots = (struct kv_pair *)(void *)(raw + bucket * sub_page_size);
+        bool empty = true;
+        for (size_t j = 0; j < bucket_capacity; j++) {
+            if (slots[j].key != 0) {
+                empty = false;
+                break;
+            }
+        }
+        index[bucket].offset = (uint32_t)running_offset;
+        index[bucket].uncompressed_bytes = empty ? 0U : (uint32_t)sub_page_size;
+        if (empty) {
+            continue;
+        }
+
+        uint32_t available = MAX_COMPRESSED_SIZE - (uint32_t)running_offset;
+        int produced = compress_subpage(ct_tree,
+                                        &codec_leaf,
+                                        raw + bucket * sub_page_size,
+                                        (uint32_t)sub_page_size,
+                                        compressed + running_offset,
+                                        available);
+        if (produced <= 0 || running_offset + (size_t)produced > MAX_COMPRESSED_SIZE) {
+            free(index);
+            return -1;
+        }
+        index[bucket].length = (uint32_t)produced;
+        running_offset += (size_t)produced;
+    }
+
+    char *data = NULL;
+    if (running_offset > 0) {
+        data = malloc(running_offset);
+        if (!data) {
+            free(index);
+            return -1;
+        }
+        memcpy(data, compressed, running_offset);
+    }
+
+    image->data = data;
+    image->size = running_offset;
+    image->usable = allocation_usable_size(data, running_offset);
+    image->index = index;
+    image->num_subpages = num_subpages;
+    image->uncompressed_bytes = count * sizeof(struct kv_pair);
+    return 0;
+}
+
+static void compressed_page_image_destroy(struct compressed_page_image *image)
+{
+    if (!image) {
+        return;
+    }
+    free(image->data);
+    free(image->index);
+    memset(image, 0, sizeof(*image));
 }
 
 static int compressed_key_binary_search(const key_t *arr, int len, key_t target)
@@ -1163,18 +2166,18 @@ static int compressed_leaf_rebuild_with_pairs(struct bplus_tree_compressed *ct_t
                                               size_t count)
 {
     int debug = getenv("TAIL_LATENCY_DEBUG") != NULL;
-    memset(leaf->landing_buffer, 0, sizeof(leaf->landing_buffer));
-    if (leaf->compressed_data) {
-        memset(leaf->compressed_data, 0, MAX_COMPRESSED_SIZE);
-    }
-    if (leaf->subpage_index && leaf->num_subpages > 0) {
-        memset(leaf->subpage_index, 0, leaf->num_subpages * sizeof(struct subpage_index_entry));
-    }
+    struct kv_pair new_active[ACTIVE_DELTA_ENTRIES];
+    memset(new_active, 0, sizeof(new_active));
 
     if (count == 0) {
-        leaf->is_compressed = false;
-        leaf->compressed_size = 0;
-        leaf->compressed_bytes = 0;
+        if (compressed_leaf_replace_base(leaf, NULL, 0) != 0) {
+            return -1;
+        }
+        memset(leaf->landing_buffer, 0, sizeof(leaf->landing_buffer));
+        if (leaf->subpage_index && leaf->num_subpages > 0) {
+            memset(leaf->subpage_index, 0,
+                   (size_t)leaf->num_subpages * sizeof(struct subpage_index_entry));
+        }
         leaf->uncompressed_bytes = 0;
         leaf->generation++;
         return 0;
@@ -1186,16 +2189,21 @@ static int compressed_leaf_rebuild_with_pairs(struct bplus_tree_compressed *ct_t
     size_t landing_count = count < landing_slots ? count : landing_slots;
 
     for (size_t i = 0; i < landing_count; i++) {
-        struct kv_pair *slot = ((struct kv_pair *)leaf->landing_buffer) + i;
+        struct kv_pair *slot = &new_active[i];
         slot->key = pairs[i].key;
         slot->stored_value = pairs[i].stored_value;
         memcpy(slot->payload, pairs[i].payload, COMPRESSED_VALUE_BYTES);
     }
 
     if (landing_count == count) {
-        leaf->is_compressed = false;
-        leaf->compressed_size = 0;
-        leaf->compressed_bytes = 0;
+        if (compressed_leaf_replace_base(leaf, NULL, 0) != 0) {
+            return -1;
+        }
+        memcpy(leaf->active, new_active, sizeof(new_active));
+        if (leaf->subpage_index && leaf->num_subpages > 0) {
+            memset(leaf->subpage_index, 0,
+                   (size_t)leaf->num_subpages * sizeof(struct subpage_index_entry));
+        }
         leaf->uncompressed_bytes = landing_count * sizeof(struct kv_pair);
         leaf->generation++;
         return 0;
@@ -1206,7 +2214,7 @@ static int compressed_leaf_rebuild_with_pairs(struct bplus_tree_compressed *ct_t
     }
 
     if (leaf->subpage_index == NULL) {
-        leaf->subpage_index = calloc(leaf->num_subpages, sizeof(struct subpage_index_entry));
+        leaf->subpage_index = leaf_index_allocate(leaf, leaf->num_subpages);
         if (!leaf->subpage_index) {
             return -1;
         }
@@ -1290,25 +2298,15 @@ static int compressed_leaf_rebuild_with_pairs(struct bplus_tree_compressed *ct_t
         fprintf(stderr, "[insert] compressed buckets bytes=%zu\n", running_offset);
     }
 
-    if (leaf->compressed_data == NULL) {
-        leaf->compressed_data = calloc(1, MAX_COMPRESSED_SIZE);
-        if (!leaf->compressed_data) {
-            free(temp_index);
-            return -1;
-        }
+    if (compressed_leaf_replace_base(leaf, temp_compressed, running_offset) != 0) {
+        free(temp_index);
+        return -1;
     }
-
-    memcpy(leaf->compressed_data, temp_compressed, running_offset);
-    if (running_offset < MAX_COMPRESSED_SIZE) {
-        memset(leaf->compressed_data + running_offset, 0, MAX_COMPRESSED_SIZE - running_offset);
-    }
+    memcpy(leaf->active, new_active, sizeof(new_active));
     memcpy(leaf->subpage_index, temp_index, leaf->num_subpages * sizeof(struct subpage_index_entry));
 
     free(temp_index);
 
-    leaf->is_compressed = true;
-    leaf->compressed_size = running_offset;
-    leaf->compressed_bytes = running_offset;
     leaf->uncompressed_bytes = hashed_count * sizeof(struct kv_pair);
     leaf->num_subpage_entries = leaf->num_subpages;
     leaf->generation++;
@@ -1334,9 +2332,10 @@ static int compressed_leaf_flush_landing_locked(struct bplus_tree_compressed *ct
 
     if (count == 0) {
         memset(leaf->landing_buffer, 0, sizeof(leaf->landing_buffer));
-        leaf->is_compressed = false;
-        leaf->compressed_size = 0;
-        leaf->compressed_bytes = 0;
+        if (compressed_leaf_replace_base(leaf, NULL, 0) != 0) {
+            free(pairs);
+            return -1;
+        }
         leaf->uncompressed_bytes = 0;
         leaf->generation++;
         free(pairs);
@@ -1437,17 +2436,8 @@ static int compressed_leaf_flush_landing_locked(struct bplus_tree_compressed *ct
         running_offset += (size_t)compressed_size;
     }
 
-    if (leaf->compressed_data == NULL) {
-        leaf->compressed_data = calloc(1, MAX_COMPRESSED_SIZE);
-        if (!leaf->compressed_data) {
-            free(temp_index);
-            free(pairs);
-            return -1;
-        }
-    }
-
     if (leaf->subpage_index == NULL) {
-        leaf->subpage_index = calloc((size_t)leaf->num_subpages, sizeof(*leaf->subpage_index));
+        leaf->subpage_index = leaf_index_allocate(leaf, leaf->num_subpages);
         if (!leaf->subpage_index) {
             free(temp_index);
             free(pairs);
@@ -1455,16 +2445,14 @@ static int compressed_leaf_flush_landing_locked(struct bplus_tree_compressed *ct
         }
     }
 
-    memset(leaf->landing_buffer, 0, sizeof(leaf->landing_buffer));
-    memcpy(leaf->compressed_data, temp_compressed, running_offset);
-    if (running_offset < MAX_COMPRESSED_SIZE) {
-        memset(leaf->compressed_data + running_offset, 0, MAX_COMPRESSED_SIZE - running_offset);
+    if (compressed_leaf_replace_base(leaf, temp_compressed, running_offset) != 0) {
+        free(temp_index);
+        free(pairs);
+        return -1;
     }
+    memset(leaf->landing_buffer, 0, sizeof(leaf->landing_buffer));
     memcpy(leaf->subpage_index, temp_index, (size_t)leaf->num_subpages * sizeof(*temp_index));
 
-    leaf->is_compressed = true;
-    leaf->compressed_size = (int)running_offset;
-    leaf->compressed_bytes = running_offset;
     leaf->uncompressed_bytes = count * sizeof(struct kv_pair);
     leaf->num_subpage_entries = leaf->num_subpages;
     leaf->generation++;
@@ -1504,11 +2492,11 @@ static int node_min_key(struct bplus_tree_compressed *ct_tree,
     }
 
     if (node->type == BPLUS_TREE_LEAF) {
-        struct bplus_leaf *leaf = (struct bplus_leaf *)node;
-        if (leaf->data[0] == 0) {
+        struct compressed_leaf_ref *leaf = (struct compressed_leaf_ref *)node;
+        if (leaf->payload == 0) {
             return -1;
         }
-        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
         return compressed_leaf_min_key(ct_tree, custom_leaf, out_key);
     }
 
@@ -1528,19 +2516,20 @@ static void propagate_min_key_change(struct bplus_node *node, key_t new_min_key)
 {
     struct bplus_non_leaf *parent = node->parent;
     struct bplus_node *child = node;
-    key_t current_min = new_min_key;
 
     while (parent) {
-        int slot = child->parent_key_idx;
-        if (slot >= 0) {
-            parent->key[slot] = current_min;
+        /* parent_key_idx is the separator immediately to this child's left:
+         * child slot 0 uses -1, slot 1 uses key[0], and so on.  A non-leftmost
+         * child's minimum changes exactly one separator and cannot change the
+         * parent subtree minimum.  A leftmost child's minimum changes no key
+         * in this parent, but must continue toward the first ancestor where
+         * the parent itself is non-leftmost. */
+        int separator_index = child->parent_key_idx;
+        if (separator_index >= 0) {
+            parent->key[separator_index] = new_min_key;
+            return;
         }
 
-        if (slot != 0) {
-            break;
-        }
-
-        current_min = parent->key[0];
         child = (struct bplus_node *)parent;
         parent = parent->parent;
     }
@@ -1552,8 +2541,10 @@ static void compressed_leaf_free(struct simple_leaf_node *leaf)
         return;
     }
     pthread_rwlock_destroy(&leaf->rwlock);
+    free(leaf->pending);
+    leaf->pending = NULL;
     free(leaf->compressed_data);
-    free(leaf->subpage_index);
+    leaf_index_release(leaf);
     free(leaf);
 }
 
@@ -1630,12 +2621,12 @@ static void background_compaction_scan_once(struct bplus_tree_compressed *ct_tre
             break;
         }
 
-        struct bplus_leaf *leaf = list_entry(pos, struct bplus_leaf, link);
-        if (leaf->type != BPLUS_TREE_LEAF || leaf->data[0] == 0) {
+        struct compressed_leaf_ref *leaf = list_entry(pos, struct compressed_leaf_ref, link);
+        if (leaf->type != BPLUS_TREE_LEAF || leaf->payload == 0) {
             continue;
         }
 
-        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
         if (!background_codec_allowed(ct_tree, custom_leaf)) {
             continue;
         }
@@ -1705,13 +2696,13 @@ static int background_compact_key(struct bplus_tree_compressed *ct_tree, key_t k
 
     pthread_rwlock_rdlock(&ct_tree->rwlock);
 
-    struct bplus_leaf *leaf = find_leaf_for_key(ct_tree->tree, key);
-    if (!leaf || leaf->type != BPLUS_TREE_LEAF || leaf->data[0] == 0) {
+    struct compressed_leaf_ref *leaf = find_leaf_for_key(ct_tree->tree, key);
+    if (!leaf || leaf->type != BPLUS_TREE_LEAF || leaf->payload == 0) {
         pthread_rwlock_unlock(&ct_tree->rwlock);
         return 0;
     }
 
-    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
     if (!background_codec_allowed(ct_tree, custom_leaf)) {
         pthread_rwlock_unlock(&ct_tree->rwlock);
         return 0;
@@ -1923,7 +2914,7 @@ static void stop_background_compaction(struct bplus_tree_compressed *ct_tree)
 }
 
 static int remove_leaf_from_parent(struct bplus_tree_compressed *ct_tree,
-                                   struct bplus_leaf *leaf)
+                                   struct compressed_leaf_ref *leaf)
 {
     struct bplus_non_leaf *parent = leaf->parent;
 
@@ -2025,121 +3016,113 @@ static int remove_leaf_from_parent(struct bplus_tree_compressed *ct_tree,
 }
 
 
-static int split_leaf(struct bplus_tree_compressed *ct_tree,
-                      struct bplus_leaf *leaf,
-                      struct bplus_leaf **new_leaf_out,
-                      key_t *split_key_out)
+/* Transfer owned representation only, never copy an initialized pthread lock. */
+static void compressed_leaf_move_representation(struct simple_leaf_node *dst,
+                                                 struct simple_leaf_node *src)
 {
-    // fprintf(stderr, "DEBUG split_leaf: ENTERED split_leaf function\n");
-    // fflush(stderr);
-
-    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
-    if (!custom_leaf) {
-        return -1;
-    }
-
-    // Lock the leaf being split (caller holds tree wrlock)
-    pthread_rwlock_wrlock(&custom_leaf->rwlock);
-
-    struct kv_pair *all_pairs = NULL;
-    size_t pair_count = 0;
-    if (compressed_leaf_collect_pairs(ct_tree, custom_leaf, &all_pairs, &pair_count) != 0 ||
-        pair_count == 0) {
-        free(all_pairs);
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-
-    qsort(all_pairs, pair_count, sizeof(struct kv_pair), compare_kv_pairs);
-
-    // Print first few keys after sorting
-    // fprintf(stderr, "DEBUG split_leaf: First 5 keys after sort: ");
-    // for (int i = 0; i < 5 && i < pair_count; i++) {
-    //     fprintf(stderr, "%d ", all_pairs[i].key);
-    // }
-    // fprintf(stderr, "\n");
-    // fflush(stderr);
-
-    // 5. Reset the original leaf and create a new leaf.
-    memset(custom_leaf->landing_buffer, 0, LANDING_BUFFER_BYTES);
-    memset(custom_leaf->compressed_data, 0, MAX_COMPRESSED_SIZE);
-    custom_leaf->is_compressed = false;
-    custom_leaf->compressed_size = 0;
-
-    struct bplus_leaf *new_bplus_leaf = (struct bplus_leaf *)bplus_node_new(ct_tree->tree, BPLUS_TREE_LEAF);
-    if (!new_bplus_leaf) {
-        free(all_pairs);
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-    struct simple_leaf_node *new_custom_leaf = calloc(1, sizeof(struct simple_leaf_node));
-    if (!new_custom_leaf) {
-        free(all_pairs);
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-
-    new_custom_leaf->compressed_data = calloc(1, MAX_COMPRESSED_SIZE);
-    if (!new_custom_leaf->compressed_data) {
-        free(new_custom_leaf);
-        free(all_pairs);
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-
-    new_custom_leaf->num_subpages = custom_leaf->num_subpages;
-    new_custom_leaf->compression_algo = custom_leaf->compression_algo;
-    pthread_rwlock_init(&new_custom_leaf->rwlock, NULL);
-    new_bplus_leaf->data[0] = (value_t)new_custom_leaf;
-
-    list_add(&new_bplus_leaf->link, &leaf->link);
-    new_bplus_leaf->parent = leaf->parent;
-    if (leaf->parent) {
-        int next_idx = (leaf->parent_key_idx < 0) ? 0 : leaf->parent_key_idx + 1;
-        new_bplus_leaf->parent_key_idx = next_idx;
+    leaf_index_release(dst);
+    if (src->subpage_index == &src->inline_index) {
+        dst->inline_index = src->inline_index;
+        dst->subpage_index = &dst->inline_index;
     } else {
-        new_bplus_leaf->parent_key_idx = 0;
+        dst->subpage_index = src->subpage_index;
     }
-
-    *new_leaf_out = new_bplus_leaf;
-
-    // 6. Distribute the sorted pairs into the two leaves.
-    size_t midpoint = pair_count / 2;
-    // fprintf(stderr, "DEBUG split_leaf: midpoint=%d\n", midpoint);
-    // fflush(stderr);
-    for (size_t i = 0; i < midpoint; i++) {
-        insert_into_leaf(ct_tree,
-                         custom_leaf,
-                         all_pairs[i].key,
-                         all_pairs[i].stored_value,
-                         all_pairs[i].payload,
-                         COMPRESSED_VALUE_BYTES);
-    }
-    for (size_t i = midpoint; i < pair_count; i++) {
-        insert_into_leaf(ct_tree,
-                         new_custom_leaf,
-                         all_pairs[i].key,
-                         all_pairs[i].stored_value,
-                         all_pairs[i].payload,
-                         COMPRESSED_VALUE_BYTES);
-    }
-
-    // 7. The split key is the first key in the new leaf.
-    key_t split_key = all_pairs[midpoint].key;
-    // fprintf(stderr, "DEBUG split_leaf: Returning split_key=%d\n", split_key);
-    // fflush(stderr);
-    free(all_pairs);
-
-    if (new_leaf_out) {
-        *new_leaf_out = new_bplus_leaf;
-    }
-    if (split_key_out) {
-        *split_key_out = split_key;
-    }
-    pthread_rwlock_unlock(&custom_leaf->rwlock);
-    return 0;
+    src->subpage_index = NULL;
+    memcpy(dst->active, src->active, sizeof(dst->active));
+    dst->num_subpages = src->num_subpages;
+    dst->num_subpage_entries = src->num_subpage_entries;
+    dst->uncompressed_bytes = src->uncompressed_bytes;
+    compressed_leaf_adopt_base(dst, src->compressed_data,
+                               src->compressed_capacity, src->compressed_usable);
+    src->compressed_data = NULL;
+    dst->generation++;
 }
 
+static int split_leaf_impl(struct bplus_tree_compressed *ct_tree,
+                      struct compressed_leaf_ref *leaf,
+                      struct compressed_leaf_ref **new_leaf_out,
+                      key_t *split_key_out)
+{
+    struct simple_leaf_node *original = (struct simple_leaf_node *)leaf->payload;
+    if (!original) return -1;
+    pthread_rwlock_wrlock(&original->rwlock);
+    struct kv_pair *pairs = NULL;
+    size_t count = 0;
+    struct compressed_leaf_ref *right_ref = NULL;
+    struct simple_leaf_node *left_image = NULL, *right_image = NULL;
+    struct split_reservation reserve = {0};
+    int rc = -1;
+    const char *fault_env = getenv("BTREE_TEST_FAIL_SPLIT_STAGE");
+    int fault = fault_env ? atoi(fault_env) : 0;
+    if (compressed_leaf_collect_pairs(ct_tree, original, &pairs, &count) || count < 2)
+        goto done;
+    qsort(pairs, count, sizeof(*pairs), compare_kv_pairs);
+    if (fault == 1 || split_reservation_prepare(ct_tree->tree, leaf, &reserve))
+        goto done;
+    right_ref = compressed_leaf_ref_new();
+    left_image = calloc(1, sizeof(*left_image));
+    right_image = calloc(1, sizeof(*right_image));
+    if (!right_ref || !left_image || !right_image) goto done;
+    /* These staging objects own bytes, but are not visible to readers/workers. */
+    left_image->num_subpages = right_image->num_subpages = original->num_subpages;
+    left_image->compression_algo = right_image->compression_algo = original->compression_algo;
+    size_t middle = count / 2;
+    if (fault == 2 ||
+        compressed_leaf_rebuild_with_pairs(ct_tree, left_image, pairs, middle))
+        goto done;
+    if (fault == 3 ||
+        compressed_leaf_rebuild_with_pairs(ct_tree, right_image, pairs + middle, count - middle))
+        goto done;
+    if (pthread_rwlock_init(&right_image->rwlock, NULL)) goto done;
+
+    /* All fallible preparation is complete. The tree write lock prevents any
+     * observer from seeing one half without the other or an unbuilt parent. */
+    compressed_leaf_move_representation(original, left_image);
+    original->pending = NULL;
+    right_ref->payload = (value_t)right_image;
+    right_ref->parent = leaf->parent;
+    right_ref->parent_key_idx = leaf->parent_key_idx + 1;
+    list_add(&right_ref->link, &leaf->link);
+    key_t split_key = pairs[middle].key;
+    bplus_tree_insert_internal(ct_tree->tree, split_key,
+                               (struct bplus_node *)leaf,
+                               (struct bplus_node *)right_ref, &reserve);
+    if (new_leaf_out) *new_leaf_out = right_ref;
+    if (split_key_out) *split_key_out = split_key;
+    right_ref = NULL;
+    right_image = NULL;
+    rc = 0;
+done:
+    split_reservation_destroy(&reserve);
+    if (left_image) {
+        leaf_index_release(left_image);
+        free(left_image->compressed_data);
+        free(left_image);
+    }
+    if (right_image) {
+        leaf_index_release(right_image);
+        free(right_image->compressed_data);
+        free(right_image);
+    }
+    free(right_ref);
+    free(pairs);
+    pthread_rwlock_unlock(&original->rwlock);
+    return rc;
+}
+
+
+static int split_leaf(struct bplus_tree_compressed *tree, struct compressed_leaf_ref *leaf,
+                      struct compressed_leaf_ref **out, key_t *key)
+{
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    int previous=agg_origin; agg_origin=BPLUS_ORIGIN_SPLIT;
+#endif
+    int result=split_leaf_impl(tree,leaf,out,key);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    agg_origin=previous;
+#endif
+    return result;
+}
 
 int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
                      struct simple_leaf_node *leaf,
@@ -2202,6 +3185,9 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
     }
 
     __atomic_add_fetch(&ct_tree->fg_landing_full, 1, __ATOMIC_RELAXED);
+    /* The default foreground rebuild performs all following codec work while
+     * the caller holds the leaf (or tree) write lock. */
+    submission_tls_write_critical = 1;
 
     if (ct_tree->debug_mode) {
         fprintf(stderr, "LANDING BUFFER FULL: Compressing for key=%d\n", key);
@@ -2326,9 +3312,9 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
 
     if (hashed_pairs == 0) {
         memset(leaf->landing_buffer, 0, LANDING_BUFFER_BYTES);
-        leaf->is_compressed = false;
-        leaf->compressed_size = 0;
-        leaf->compressed_bytes = 0;
+        if (compressed_leaf_replace_base(leaf, NULL, 0) != 0) {
+            return -1;
+        }
         leaf->uncompressed_bytes = 0;
         leaf->generation++;
         return 0;
@@ -2383,16 +3369,8 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
     }
     if (trace) fprintf(stderr, "[insert] compressed buckets bytes=%zu\n", running_offset);
 
-    if (leaf->compressed_data == NULL) {
-        leaf->compressed_data = calloc(1, MAX_COMPRESSED_SIZE);
-        if (!leaf->compressed_data) {
-            free(temp_index);
-            return -1;
-        }
-    }
-
     if (leaf->subpage_index == NULL) {
-        leaf->subpage_index = calloc(leaf->num_subpages, sizeof(struct subpage_index_entry));
+        leaf->subpage_index = leaf_index_allocate(leaf, leaf->num_subpages);
         if (!leaf->subpage_index) {
             free(temp_index);
             __atomic_add_fetch(&ct_tree->fg_sync_compaction_errors, 1, __ATOMIC_RELAXED);
@@ -2400,16 +3378,14 @@ int insert_into_leaf(struct bplus_tree_compressed *ct_tree,
         }
     }
 
-    memset(leaf->landing_buffer, 0, LANDING_BUFFER_BYTES);
-    memcpy(leaf->compressed_data, temp_compressed, running_offset);
-    if (running_offset < MAX_COMPRESSED_SIZE) {
-        memset(leaf->compressed_data + running_offset, 0, MAX_COMPRESSED_SIZE - running_offset);
+    if (compressed_leaf_replace_base(leaf, temp_compressed, running_offset) != 0) {
+        free(temp_index);
+        __atomic_add_fetch(&ct_tree->fg_sync_compaction_errors, 1, __ATOMIC_RELAXED);
+        return -1;
     }
+    memset(leaf->landing_buffer, 0, LANDING_BUFFER_BYTES);
     memcpy(leaf->subpage_index, temp_index, leaf->num_subpages * sizeof(struct subpage_index_entry));
 
-    leaf->is_compressed = true;
-    leaf->compressed_size = running_offset;
-    leaf->compressed_bytes = running_offset;
     leaf->uncompressed_bytes = hashed_pairs * sizeof(struct kv_pair);
     leaf->generation++;
 
@@ -2443,6 +3419,125 @@ static void kv_pair_set_value(struct kv_pair *entry,
         memcpy(entry->payload, &stored_value,
                sizeof(stored_value) > COMPRESSED_VALUE_BYTES ? COMPRESSED_VALUE_BYTES : sizeof(stored_value));
     }
+}
+
+/* Called with the leaf write lock held. */
+static int compaction_insert_locked(struct bplus_tree_compressed *ct_tree,
+                                    struct simple_leaf_node *leaf,
+                                    key_t key,
+                                    int stored_value,
+                                    const uint8_t *payload,
+                                    size_t payload_len,
+                                    int *must_wait,
+                                    int *used_sync_fallback)
+{
+    if (!ct_tree || !leaf || !must_wait || !used_sync_fallback) {
+        return -1;
+    }
+    *must_wait = 0;
+    *used_sync_fallback = 0;
+
+    struct kv_pair *free_slot = NULL;
+    for (int i = 0; i < ACTIVE_DELTA_ENTRIES; i++) {
+        if (leaf->active[i].key == key) {
+            kv_pair_set_value(&leaf->active[i], key, stored_value, payload, payload_len);
+            leaf->generation++;
+            return 0;
+        }
+        if (leaf->active[i].key == 0 && !free_slot) {
+            free_slot = &leaf->active[i];
+        }
+    }
+
+    if (free_slot) {
+        kv_pair_set_value(free_slot, key, stored_value, payload, payload_len);
+        leaf->generation++;
+        return 0;
+    }
+
+    if (leaf->pending) {
+        if (pending_task_state_load(leaf->pending) == PENDING_TASK_FAILED) {
+            return -1;
+        }
+        *must_wait = 1;
+        return 0;
+    }
+
+    int include_trigger = env_bool_enabled("BTREE_BG_INCLUDE_TRIGGER", 0);
+    size_t task_bytes = sizeof(struct compressed_pending_task) +
+        (size_t)(ACTIVE_DELTA_ENTRIES + include_trigger) * sizeof(struct kv_pair);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    struct compaction_scheduler *admission = ct_tree->scheduler;
+    if (admission->admission_control) {
+        pthread_mutex_lock(&admission->lock);
+        size_t slots = admission->pending_byte_limit / admission->pending_charge;
+        size_t live = admission->submitted_tasks - admission->completed_tasks;
+        if (!admission->accepting || admission->shutdown ||
+            slots <= admission->failed_tasks) {
+            pthread_mutex_unlock(&admission->lock);
+            return -1; /* Failed pending remains charged and readable. */
+        }
+        if ((size_t)admission->queue_count + admission->admission_reserved >= (size_t)admission->queue_capacity ||
+            live + admission->admission_reserved >= slots) {
+            *must_wait = 2;
+            pthread_mutex_unlock(&admission->lock);
+            return 0;
+        }
+        admission->admission_reserved++;
+        pthread_mutex_unlock(&admission->lock);
+    }
+#endif
+    struct compressed_pending_task *task =
+        env_bool_enabled("BTREE_TEST_FAIL_PENDING_ALLOC", 0)
+            ? NULL : calloc(1, task_bytes);
+    if (!task) {
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        if (admission->admission_control) {
+            pthread_mutex_lock(&admission->lock);
+            admission->admission_reserved--;
+            pthread_cond_broadcast(&admission->state_changed);
+            pthread_mutex_unlock(&admission->lock);
+            return -1;
+        }
+#endif
+        *used_sync_fallback = 1;
+        return 1;
+    }
+    task->tree = ct_tree;
+    task->leaf = leaf;
+    task->base_version = leaf->base_version;
+    task->token = ++leaf->pending_token;
+    task->enqueued_ns = submission_now_ns();
+    pending_task_state_store(task, PENDING_TASK_QUEUED);
+    for (int i = 0; i < ACTIVE_DELTA_ENTRIES; i++) {
+        if (leaf->active[i].key != 0) {
+            task->records[task->count++] = leaf->active[i];
+        }
+    }
+
+    struct kv_pair old_active[ACTIVE_DELTA_ENTRIES];
+    memcpy(old_active, leaf->active, sizeof(old_active));
+    memset(leaf->active, 0, sizeof(leaf->active));
+    leaf->pending = task;
+    if (include_trigger) {
+        kv_pair_set_value(&task->records[task->count++], key, stored_value, payload, payload_len);
+    } else {
+        kv_pair_set_value(&leaf->active[0], key, stored_value, payload, payload_len);
+    }
+
+    if (compaction_scheduler_enqueue_locked(ct_tree, leaf, task) != 0) {
+        memcpy(leaf->active, old_active, sizeof(old_active));
+        leaf->pending = NULL;
+        free(task);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        if (admission->admission_control) return -1;
+#endif
+        *used_sync_fallback = 1;
+        return 1;
+    }
+
+    leaf->generation++;
+    return 0;
 }
 
 /*
@@ -2702,22 +3797,8 @@ static int insert_into_leaf_maybe_out_of_lock(struct bplus_tree_compressed *ct_t
         return 0;
     }
 
-    if (leaf->compressed_data == NULL) {
-        leaf->compressed_data = calloc(1, MAX_COMPRESSED_SIZE);
-        if (!leaf->compressed_data) {
-            *old_uncompressed = snapshot_uncompressed;
-            *old_compressed = snapshot_compressed;
-            *result = -1;
-            *handled = 1;
-            free(compressed_copy);
-            free(index_copy);
-            free(temp_index);
-            return 0;
-        }
-    }
-
     if (leaf->subpage_index == NULL) {
-        leaf->subpage_index = calloc((size_t)num_subpages, sizeof(*leaf->subpage_index));
+        leaf->subpage_index = leaf_index_allocate(leaf, num_subpages);
         if (!leaf->subpage_index) {
             *old_uncompressed = snapshot_uncompressed;
             *old_compressed = snapshot_compressed;
@@ -2730,18 +3811,21 @@ static int insert_into_leaf_maybe_out_of_lock(struct bplus_tree_compressed *ct_t
         }
     }
 
-    memset(leaf->landing_buffer, 0, LANDING_BUFFER_BYTES);
-    memcpy(leaf->compressed_data, temp_compressed, running_offset);
-    if (running_offset < MAX_COMPRESSED_SIZE) {
-        memset(leaf->compressed_data + running_offset, 0, MAX_COMPRESSED_SIZE - running_offset);
+    if (compressed_leaf_replace_base(leaf, temp_compressed, running_offset) != 0) {
+        *old_uncompressed = snapshot_uncompressed;
+        *old_compressed = snapshot_compressed;
+        *result = -1;
+        *handled = 1;
+        free(compressed_copy);
+        free(index_copy);
+        free(temp_index);
+        return 0;
     }
+    memset(leaf->landing_buffer, 0, LANDING_BUFFER_BYTES);
     memcpy(leaf->subpage_index, temp_index, (size_t)num_subpages * sizeof(*temp_index));
 
     leaf->num_subpages = num_subpages;
     leaf->num_subpage_entries = num_subpages;
-    leaf->is_compressed = true;
-    leaf->compressed_size = (int)running_offset;
-    leaf->compressed_bytes = running_offset;
     leaf->uncompressed_bytes = hashed_pairs * sizeof(struct kv_pair);
     leaf->generation++;
 
@@ -2757,7 +3841,7 @@ static int insert_into_leaf_maybe_out_of_lock(struct bplus_tree_compressed *ct_t
 }
 
 static int ensure_custom_leaf(struct bplus_tree_compressed *ct_tree,
-                              struct bplus_leaf *leaf,
+                              struct compressed_leaf_ref *leaf,
                               struct simple_leaf_node **out_leaf)
 {
     struct simple_leaf_node *custom_leaf = NULL;
@@ -2766,8 +3850,8 @@ static int ensure_custom_leaf(struct bplus_tree_compressed *ct_tree,
         return -1;
     }
 
-    if (leaf->entries == 0 && leaf->data[0] != 0) {
-        custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+    if (leaf->entries == 0 && leaf->payload != 0) {
+        custom_leaf = (struct simple_leaf_node *)leaf->payload;
         if (out_leaf) {
             *out_leaf = custom_leaf;
         }
@@ -2779,36 +3863,12 @@ static int ensure_custom_leaf(struct bplus_tree_compressed *ct_tree,
         return -1;
     }
 
-    custom_leaf->compressed_data = calloc(1, MAX_COMPRESSED_SIZE);
-    if (!custom_leaf->compressed_data) {
-        free(custom_leaf);
-        return -1;
-    }
-
     custom_leaf->num_subpages = ct_tree->config.default_sub_pages;
     custom_leaf->compression_algo = ct_tree->config.algo;
     pthread_rwlock_init(&custom_leaf->rwlock, NULL);
 
-    if (leaf->entries > 0) {
-        for (int i = 0; i < leaf->entries; i++) {
-            if (insert_into_leaf(ct_tree,
-                                 custom_leaf,
-                                 leaf->key[i],
-                                 (int)leaf->data[i],
-                                 NULL,
-                                 0) != 0) {
-                free(custom_leaf->compressed_data);
-                pthread_rwlock_destroy(&custom_leaf->rwlock);
-                free(custom_leaf);
-                return -1;
-            }
-        }
-    }
-
     leaf->entries = 0;
-    memset(leaf->key, 0, sizeof(leaf->key));
-    memset(leaf->data, 0, sizeof(leaf->data));
-    leaf->data[0] = (value_t)custom_leaf;
+    leaf->payload = (value_t)custom_leaf;
 
     if (out_leaf) {
         *out_leaf = custom_leaf;
@@ -2817,13 +3877,13 @@ static int ensure_custom_leaf(struct bplus_tree_compressed *ct_tree,
     return 0;
 }
 
-static struct bplus_leaf* find_leaf_for_key(struct bplus_tree *tree, key_t key)
+static struct compressed_leaf_ref* find_leaf_for_key(struct bplus_tree *tree, key_t key)
 {
     struct bplus_node *node = tree->root;
     
     while (node != NULL) {
         if (node->type == BPLUS_TREE_LEAF) {
-            return (struct bplus_leaf*)node;
+            return (struct compressed_leaf_ref*)node;
         } else {
             struct bplus_non_leaf *nln = (struct bplus_non_leaf*)node;
             int i;
@@ -2934,6 +3994,7 @@ static key_t compressed_non_leaf_split_right1(struct bplus_non_leaf *node,
                                               int insert,
                                               int split)
 {
+    (void)insert;
     int i, j, order = node->children;
     key_t split_key;
 
@@ -3012,10 +4073,10 @@ static int compressed_parent_node_build(struct bplus_tree *tree,
                                         struct bplus_node *left,
                                         struct bplus_node *right,
                                         key_t key,
-                                        int level)
+                                        int level, struct split_reservation *reserve)
 {
     if (left->parent == NULL && right->parent == NULL) {
-        struct bplus_non_leaf *parent = (struct bplus_non_leaf *)bplus_node_new(tree, BPLUS_TREE_NON_LEAF);
+        struct bplus_non_leaf *parent = split_reservation_take(reserve);
         parent->key[0] = key;
         parent->sub_ptr[0] = left;
         parent->sub_ptr[0]->parent = parent;
@@ -3029,10 +4090,10 @@ static int compressed_parent_node_build(struct bplus_tree *tree,
         return 0;
     } else if (right->parent == NULL) {
         right->parent = left->parent;
-        return compressed_non_leaf_insert(tree, left->parent, left, right, key, level + 1);
+        return compressed_non_leaf_insert(tree, left->parent, left, right, key, level + 1, reserve);
     } else {
         left->parent = right->parent;
-        return compressed_non_leaf_insert(tree, right->parent, left, right, key, level + 1);
+        return compressed_non_leaf_insert(tree, right->parent, left, right, key, level + 1, reserve);
     }
 }
 
@@ -3041,7 +4102,7 @@ static int compressed_non_leaf_insert(struct bplus_tree *tree,
                                       struct bplus_node *l_ch,
                                       struct bplus_node *r_ch,
                                       key_t key,
-                                      int level)
+                                      int level, struct split_reservation *reserve)
 {
     int insert = compressed_key_binary_search(node->key, node->children - 1, key);
     assert(insert < 0);
@@ -3050,7 +4111,7 @@ static int compressed_non_leaf_insert(struct bplus_tree *tree,
     if (node->children == tree->order) {
         key_t split_key;
         int split = node->children / 2;
-        struct bplus_non_leaf *sibling = (struct bplus_non_leaf *)bplus_node_new(tree, BPLUS_TREE_NON_LEAF);
+        struct bplus_non_leaf *sibling = split_reservation_take(reserve);
 
         if (insert < split) {
             split_key = compressed_non_leaf_split_left(node, sibling, l_ch, r_ch, key, insert, split);
@@ -3062,10 +4123,10 @@ static int compressed_non_leaf_insert(struct bplus_tree *tree,
 
         if (insert < split) {
             return compressed_parent_node_build(tree, (struct bplus_node *)sibling,
-                                               (struct bplus_node *)node, split_key, level);
+                                               (struct bplus_node *)node, split_key, level, reserve);
         } else {
             return compressed_parent_node_build(tree, (struct bplus_node *)node,
-                                               (struct bplus_node *)sibling, split_key, level);
+                                               (struct bplus_node *)sibling, split_key, level, reserve);
         }
     } else {
         compressed_non_leaf_simple_insert(node, l_ch, r_ch, key, insert);
@@ -3078,9 +4139,9 @@ static int compressed_non_leaf_insert(struct bplus_tree *tree,
 static int bplus_tree_insert_internal(struct bplus_tree *tree,
                                       key_t key,
                                       struct bplus_node *left,
-                                      struct bplus_node *right)
+                                      struct bplus_node *right, struct split_reservation *reserve)
 {
-    return compressed_parent_node_build(tree, left, right, key, 0);
+    return compressed_parent_node_build(tree, left, right, key, 0, reserve);
 }
 
 
@@ -3128,21 +4189,33 @@ static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_t
                                               const uint8_t *payload,
                                               size_t payload_len)
 {
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    /* This is the top-level foreground operation. Structural helpers override
+     * its origin for their duration; ordinary seals/rebuilds are compaction. */
+    agg_origin = BPLUS_ORIGIN_COMPACTION;
+#endif
     if (ct_tree == NULL || !ct_tree->initialized || ct_tree->tree == NULL) {
         return -1;
     }
 
+    submission_profile_begin_logical(ct_tree, SUBMISSION_LOGICAL_WRITE);
+
+retry_lookup:
     // --- Fast path: tree rdlock → find leaf → leaf wrlock → release tree ---
     pthread_rwlock_rdlock(&ct_tree->rwlock);
 
-    struct bplus_leaf *leaf = find_leaf_for_key(ct_tree->tree, key);
+    struct compressed_leaf_ref *leaf = find_leaf_for_key(ct_tree->tree, key);
     if (leaf == NULL) {
         // Tree is empty — need wrlock to create first leaf
         pthread_rwlock_unlock(&ct_tree->rwlock);
         pthread_rwlock_wrlock(&ct_tree->rwlock);
         leaf = find_leaf_for_key(ct_tree->tree, key);
         if (leaf == NULL) {
-            leaf = (struct bplus_leaf *)bplus_node_new(ct_tree->tree, BPLUS_TREE_LEAF);
+            leaf = compressed_leaf_ref_new();
+            if (!leaf) {
+                pthread_rwlock_unlock(&ct_tree->rwlock);
+                return -1;
+            }
             ct_tree->tree->root = (struct bplus_node *)leaf;
             list_add(&leaf->link, &ct_tree->tree->list[0]);
         }
@@ -3163,7 +4236,7 @@ static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_t
     }
 
     struct simple_leaf_node *custom_leaf = NULL;
-    if (leaf->entries > 0 || leaf->data[0] == 0) {
+    if (leaf->entries > 0 || leaf->payload == 0) {
         // Need ensure_custom_leaf — requires tree wrlock
         pthread_rwlock_unlock(&ct_tree->rwlock);
         pthread_rwlock_wrlock(&ct_tree->rwlock);
@@ -3181,13 +4254,13 @@ static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_t
         pthread_rwlock_rdlock(&ct_tree->rwlock);
         // Re-find leaf (tree may have changed during lock switch)
         leaf = find_leaf_for_key(ct_tree->tree, key);
-        if (!leaf || leaf->data[0] == 0) {
+        if (!leaf || leaf->payload == 0) {
             pthread_rwlock_unlock(&ct_tree->rwlock);
             return -1;
         }
-        custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        custom_leaf = (struct simple_leaf_node *)leaf->payload;
     } else {
-        custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        custom_leaf = (struct simple_leaf_node *)leaf->payload;
     }
 
     // Lock this specific leaf for writing, then release tree lock
@@ -3199,21 +4272,62 @@ static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_t
 
     int result = 0;
     int handled_out_of_lock = 0;
-    if (insert_into_leaf_maybe_out_of_lock(ct_tree,
-                                           custom_leaf,
-                                           key,
-                                           data,
-                                           payload,
-                                           payload_len,
-                                           &handled_out_of_lock,
-                                           &result,
-                                           &old_uncompressed,
-                                           &old_compressed) != 0) {
-        result = -1;
+    if (ct_tree->scheduler) {
+        int must_wait = 0;
+        int used_sync_fallback = 0;
+        int async_result = compaction_insert_locked(ct_tree,
+                                                    custom_leaf,
+                                                    key,
+                                                    data,
+                                                    payload,
+                                                    payload_len,
+                                                    &must_wait,
+                                                    &used_sync_fallback);
+        if (must_wait) {
+            struct compaction_scheduler *scheduler = ct_tree->scheduler;
+            pthread_rwlock_unlock(&custom_leaf->rwlock);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+            uint64_t admission_elapsed =
+#endif
+                compaction_scheduler_wait_for_change(scheduler);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+            if (must_wait == 2) {
+                AGG_INC(admission_waits, 1);
+                AGG_INC(admission_wait_ns, admission_elapsed);
+            }
+#endif
+            goto retry_lookup;
+        }
+        if (async_result < 0) {
+            pthread_rwlock_unlock(&custom_leaf->rwlock);
+            return -1;
+        }
+        if (used_sync_fallback) {
+            pthread_mutex_lock(&ct_tree->scheduler->lock);
+            ct_tree->scheduler->synchronous_fallbacks++;
+            pthread_mutex_unlock(&ct_tree->scheduler->lock);
+            result = insert_into_leaf(ct_tree, custom_leaf, key, data, payload, payload_len);
+        } else {
+            result = 0;
+        }
         handled_out_of_lock = 1;
-    }
-    if (!handled_out_of_lock) {
-        result = insert_into_leaf(ct_tree, custom_leaf, key, data, payload, payload_len);
+    } else {
+        if (insert_into_leaf_maybe_out_of_lock(ct_tree,
+                                               custom_leaf,
+                                               key,
+                                               data,
+                                               payload,
+                                               payload_len,
+                                               &handled_out_of_lock,
+                                               &result,
+                                               &old_uncompressed,
+                                               &old_compressed) != 0) {
+            result = -1;
+            handled_out_of_lock = 1;
+        }
+        if (!handled_out_of_lock) {
+            result = insert_into_leaf(ct_tree, custom_leaf, key, data, payload, payload_len);
+        }
     }
     if (result != 0 && ct_tree->debug_mode) {
         fprintf(stderr, "[put_internal] insert_into_leaf returned %d for key=%d\n", result, key);
@@ -3235,17 +4349,17 @@ static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_t
 
         // Re-find leaf under tree wrlock (tree may have changed)
         leaf = find_leaf_for_key(ct_tree->tree, key);
-        if (!leaf || leaf->data[0] == 0) {
+        if (!leaf || leaf->payload == 0) {
             pthread_rwlock_unlock(&ct_tree->rwlock);
             return -1;
         }
-        custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        custom_leaf = (struct simple_leaf_node *)leaf->payload;
 
         if (ct_tree->debug_mode) {
             fprintf(stderr, "=== EXECUTING SPLIT for key %d ===\n", key);
             fflush(stderr);
         }
-        struct bplus_leaf *new_leaf = NULL;
+        struct compressed_leaf_ref *new_leaf = NULL;
         key_t split_key = 0;
         int split_rc = split_leaf(ct_tree, leaf, &new_leaf, &split_key);
         if (ct_tree->debug_mode) {
@@ -3260,20 +4374,11 @@ static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_t
             return -1;
         }
 
-        // Insert split key into parent
-        struct bplus_node *left_node = (struct bplus_node *)leaf;
-        struct bplus_node *right_node = (struct bplus_node *)new_leaf;
-        int parent_rc = bplus_tree_insert_internal(ct_tree->tree, split_key, left_node, right_node);
-        if (parent_rc != 0) {
-            pthread_rwlock_unlock(&ct_tree->rwlock);
-            return parent_rc;
-        }
-
         // Retry insert under tree wrlock (we already have it, just do it)
         if (key < split_key) {
             result = insert_into_leaf(ct_tree, custom_leaf, key, data, payload, payload_len);
         } else {
-            struct simple_leaf_node *new_custom_leaf = (struct simple_leaf_node*)new_leaf->data[0];
+            struct simple_leaf_node *new_custom_leaf = (struct simple_leaf_node*)new_leaf->payload;
             result = insert_into_leaf(ct_tree, new_custom_leaf, key, data, payload, payload_len);
         }
         pthread_rwlock_unlock(&ct_tree->rwlock);
@@ -3285,136 +4390,7 @@ static int bplus_tree_compressed_put_internal(struct bplus_tree_compressed *ct_t
 }
 
 
-int bplus_tree_compressed_get(struct bplus_tree_compressed *ct_tree, key_t key)
-{
-    if (compressed_tree_is_sharded(ct_tree)) {
-        return bplus_tree_compressed_get(compressed_tree_shard_for_key(ct_tree, key), key);
-    }
-
-    if (ct_tree == NULL || !ct_tree->initialized || ct_tree->tree == NULL) {
-        return -1;
-    }
-
-    // Tree rdlock to find the leaf
-    pthread_rwlock_rdlock(&ct_tree->rwlock);
-    struct bplus_leaf *leaf = find_leaf_for_key(ct_tree->tree, key);
-    if (!leaf) {
-        pthread_rwlock_unlock(&ct_tree->rwlock);
-        return -1;
-    }
-
-    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node*)leaf->data[0];
-
-    if (leaf->entries > 0 || custom_leaf == NULL) {
-        // Need ensure_custom_leaf — upgrade to write lock
-        pthread_rwlock_unlock(&ct_tree->rwlock);
-        pthread_rwlock_wrlock(&ct_tree->rwlock);
-        leaf = find_leaf_for_key(ct_tree->tree, key);
-        if (!leaf) {
-            pthread_rwlock_unlock(&ct_tree->rwlock);
-            return -1;
-        }
-        if (ensure_custom_leaf(ct_tree, leaf, &custom_leaf) != 0 || custom_leaf == NULL) {
-            pthread_rwlock_unlock(&ct_tree->rwlock);
-            return -1;
-        }
-        // Downgrade to rdlock
-        pthread_rwlock_unlock(&ct_tree->rwlock);
-        pthread_rwlock_rdlock(&ct_tree->rwlock);
-        leaf = find_leaf_for_key(ct_tree->tree, key);
-        if (!leaf || leaf->data[0] == 0) {
-            pthread_rwlock_unlock(&ct_tree->rwlock);
-            return -1;
-        }
-        custom_leaf = (struct simple_leaf_node *)leaf->data[0];
-    }
-
-    // Lock this leaf for reading, then release tree lock
-    pthread_rwlock_rdlock(&custom_leaf->rwlock);
-    pthread_rwlock_unlock(&ct_tree->rwlock);
-
-    // 1. Search landing buffer
-    struct kv_pair *p = (struct kv_pair *)custom_leaf->landing_buffer;
-    struct kv_pair *end = (struct kv_pair *)(custom_leaf->landing_buffer +
-                                             landing_buffer_bytes_for_tree(ct_tree));
-    while (p < end) {
-        if (p->key == key) {
-            int value = p->stored_value;
-            pthread_rwlock_unlock(&custom_leaf->rwlock);
-            return value;
-        }
-        p++;
-    }
-
-    // 2. Search compressed sub-pages
-    if (!custom_leaf->is_compressed) {
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-
-    if (custom_leaf->subpage_index == NULL || custom_leaf->num_subpages <= 0) {
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-
-    int target_bucket = hash_key_to_sub_page(key, custom_leaf->num_subpages);
-    int sub_page_size = COMPRESSED_LEAF_SIZE / custom_leaf->num_subpages;
-    if (sub_page_size <= 0) {
-        sub_page_size = COMPRESSED_LEAF_SIZE;
-    }
-
-    struct subpage_index_entry *entry = &custom_leaf->subpage_index[target_bucket];
-    if (!entry || entry->length <= 0) {
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-    if (entry->length > MAX_COMPRESSED_SIZE ||
-        entry->offset + entry->length > (uint32_t)custom_leaf->compressed_size) {
-        pthread_rwlock_unlock(&custom_leaf->rwlock);
-        return -1;
-    }
-
-    /*
-     * Copy the compressed subpage while the leaf is locked, then perform the
-     * expensive decompression outside the leaf lock. The returned value is
-     * still a consistent snapshot from the time of the copy, but writers no
-     * longer wait for LZ4/QPL/zlib decompression on the read path.
-     */
-    uint8_t compressed_copy[MAX_COMPRESSED_SIZE];
-    uint32_t compressed_len = entry->length;
-    struct simple_leaf_node leaf_snapshot;
-    memset(&leaf_snapshot, 0, sizeof(leaf_snapshot));
-    leaf_snapshot.compression_algo = custom_leaf->compression_algo;
-    leaf_snapshot.num_subpages = custom_leaf->num_subpages;
-    memcpy(compressed_copy,
-           (const uint8_t *)custom_leaf->compressed_data + entry->offset,
-           compressed_len);
-    pthread_rwlock_unlock(&custom_leaf->rwlock);
-
-    uint8_t buffer[COMPRESSED_LEAF_SIZE];
-
-    int rc = decompress_subpage(ct_tree,
-                                &leaf_snapshot,
-                                compressed_copy,
-                                compressed_len,
-                                buffer,
-                                sub_page_size);
-    if (rc < 0) {
-        return -1;
-    }
-
-    int result = -1;
-    struct kv_pair *sp = (struct kv_pair *)buffer;
-    struct kv_pair *sp_end = sp + (sub_page_size / (int)sizeof(struct kv_pair));
-    while (sp < sp_end) {
-        if (sp->key == key) {
-            result = sp->stored_value;
-            break;
-        }
-        sp++;
-    }
-    return result;
-}
+#include "bplustree_compressed_read.inc"
 
 int bplus_tree_compressed_get_range(struct bplus_tree_compressed *ct_tree, key_t key1, key_t key2)
 {
@@ -3454,13 +4430,14 @@ int bplus_tree_compressed_get_range(struct bplus_tree_compressed *ct_tree, key_t
     if (ct_tree == NULL || !ct_tree->initialized || ct_tree->tree == NULL) {
         return -1;
     }
+
+    pthread_rwlock_rdlock(&ct_tree->rwlock);
     if (ct_tree->tree->root == NULL) {
+        pthread_rwlock_unlock(&ct_tree->rwlock);
         return -1;
     }
 
-    pthread_rwlock_rdlock(&ct_tree->rwlock);
-
-    struct bplus_leaf *leaf = find_leaf_for_key(ct_tree->tree, min_key);
+    struct compressed_leaf_ref *leaf = find_leaf_for_key(ct_tree->tree, min_key);
     if (!leaf) {
         pthread_rwlock_unlock(&ct_tree->rwlock);
         return -1;
@@ -3471,7 +4448,7 @@ int bplus_tree_compressed_get_range(struct bplus_tree_compressed *ct_tree, key_t
     bool stop = false;
 
     while (leaf && !stop) {
-        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
         if (custom_leaf == NULL) {
             if (list_is_last(&leaf->link, &ct_tree->tree->list[0])) {
                 break;
@@ -3535,6 +4512,23 @@ int bplus_tree_compressed_get_range(struct bplus_tree_compressed *ct_tree, key_t
                 }
 
                 if (rc != 0) {
+                    break;
+                }
+            }
+        }
+
+        if (rc == 0 && custom_leaf->pending) {
+            for (size_t i = 0; i < custom_leaf->pending->count; i++) {
+                struct kv_pair *entry = &custom_leaf->pending->records[i];
+                if (entry->key != 0 &&
+                    kv_vector_put(&leaf_pairs,
+                                  &leaf_count,
+                                  &leaf_capacity,
+                                  entry->key,
+                                  entry->stored_value,
+                                  entry->payload,
+                                  COMPRESSED_VALUE_BYTES) != 0) {
+                    rc = -1;
                     break;
                 }
             }
@@ -3610,7 +4604,7 @@ int bplus_tree_compressed_get_range(struct bplus_tree_compressed *ct_tree, key_t
     return found ? last_value : -1;
 }
 
-int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t key)
+static int bplus_tree_compressed_delete_impl(struct bplus_tree_compressed *ct_tree, key_t key)
 {
     if (compressed_tree_is_sharded(ct_tree)) {
         return bplus_tree_compressed_delete(compressed_tree_shard_for_key(ct_tree, key), key);
@@ -3620,21 +4614,35 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
         return -1;
     }
 
+retry_delete:
     // Fast path: missing keys and non-min-key deletes do not need tree structure updates.
     pthread_rwlock_rdlock(&ct_tree->rwlock);
-    struct bplus_leaf *fast_leaf = find_leaf_for_key(ct_tree->tree, key);
-    if (!fast_leaf || fast_leaf->data[0] == 0) {
+    struct compressed_leaf_ref *fast_leaf = find_leaf_for_key(ct_tree->tree, key);
+    if (!fast_leaf || fast_leaf->payload == 0) {
         pthread_rwlock_unlock(&ct_tree->rwlock);
         return -1;
     }
 
-    struct simple_leaf_node *fast_custom_leaf = (struct simple_leaf_node *)fast_leaf->data[0];
+    struct simple_leaf_node *fast_custom_leaf = (struct simple_leaf_node *)fast_leaf->payload;
     pthread_rwlock_wrlock(&fast_custom_leaf->rwlock);
     pthread_rwlock_unlock(&ct_tree->rwlock);
+
+    if (fast_custom_leaf->pending &&
+        pending_task_state_load(fast_custom_leaf->pending) != PENDING_TASK_FAILED) {
+        struct compaction_scheduler *scheduler = ct_tree->scheduler;
+        pthread_rwlock_unlock(&fast_custom_leaf->rwlock);
+        compaction_scheduler_wait_for_change(scheduler);
+        goto retry_delete;
+    }
 
     struct kv_pair *fast_pairs = NULL;
     size_t fast_count = 0;
     if (compressed_leaf_collect_pairs(ct_tree, fast_custom_leaf, &fast_pairs, &fast_count) == 0 && fast_count > 0) {
+        if (fast_custom_leaf->pending &&
+            pending_task_state_load(fast_custom_leaf->pending) == PENDING_TASK_FAILED) {
+            free(fast_custom_leaf->pending);
+            fast_custom_leaf->pending = NULL;
+        }
         ssize_t fast_remove_index = -1;
         key_t fast_min_key = fast_pairs[0].key;
         for (size_t i = 0; i < fast_count; i++) {
@@ -3673,14 +4681,23 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
     // Slow path handles deleting the leaf minimum, empty leaves, parent key updates, and rebalancing.
     pthread_rwlock_wrlock(&ct_tree->rwlock);
 
-    struct bplus_leaf *leaf = find_leaf_for_key(ct_tree->tree, key);
-    if (!leaf || leaf->data[0] == 0) {
+    struct compressed_leaf_ref *leaf = find_leaf_for_key(ct_tree->tree, key);
+    if (!leaf || leaf->payload == 0) {
         pthread_rwlock_unlock(&ct_tree->rwlock);
         return -1;
     }
 
-    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+    struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
     pthread_rwlock_wrlock(&custom_leaf->rwlock);
+
+    if (custom_leaf->pending &&
+        pending_task_state_load(custom_leaf->pending) != PENDING_TASK_FAILED) {
+        struct compaction_scheduler *scheduler = ct_tree->scheduler;
+        pthread_rwlock_unlock(&custom_leaf->rwlock);
+        pthread_rwlock_unlock(&ct_tree->rwlock);
+        compaction_scheduler_wait_for_change(scheduler);
+        goto retry_delete;
+    }
 
     struct kv_pair *pairs = NULL;
     size_t count = 0;
@@ -3688,6 +4705,12 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
         pthread_rwlock_unlock(&custom_leaf->rwlock);
         pthread_rwlock_unlock(&ct_tree->rwlock);
         return -1;
+    }
+
+    if (custom_leaf->pending &&
+        pending_task_state_load(custom_leaf->pending) == PENDING_TASK_FAILED) {
+        free(custom_leaf->pending);
+        custom_leaf->pending = NULL;
     }
 
     if (count == 0) {
@@ -3722,6 +4745,52 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
         return -1;
     }
 
+    /*
+     * If this delete empties the leaf, the rebalance path may rebuild a
+     * neighbour.  Drain that neighbour before changing any resident state;
+     * otherwise its worker could later commit against a base_version that the
+     * borrow operation replaced.
+     */
+    if (count == 1) {
+        struct compressed_leaf_ref *left_candidate =
+            list_is_first(&leaf->link, &ct_tree->tree->list[0])
+                ? NULL : list_prev_entry(leaf, link);
+        struct compressed_leaf_ref *right_candidate =
+            list_is_last(&leaf->link, &ct_tree->tree->list[0])
+                ? NULL : list_next_entry(leaf, link);
+        struct simple_leaf_node *pending_neighbour = NULL;
+
+        if (left_candidate && left_candidate->payload != 0) {
+            struct simple_leaf_node *candidate =
+                (struct simple_leaf_node *)left_candidate->payload;
+            pthread_rwlock_rdlock(&candidate->rwlock);
+            if (candidate->pending &&
+                pending_task_state_load(candidate->pending) != PENDING_TASK_FAILED) {
+                pending_neighbour = candidate;
+            }
+            pthread_rwlock_unlock(&candidate->rwlock);
+        }
+        if (!pending_neighbour && right_candidate && right_candidate->payload != 0) {
+            struct simple_leaf_node *candidate =
+                (struct simple_leaf_node *)right_candidate->payload;
+            pthread_rwlock_rdlock(&candidate->rwlock);
+            if (candidate->pending &&
+                pending_task_state_load(candidate->pending) != PENDING_TASK_FAILED) {
+                pending_neighbour = candidate;
+            }
+            pthread_rwlock_unlock(&candidate->rwlock);
+        }
+
+        if (pending_neighbour) {
+            struct compaction_scheduler *scheduler = ct_tree->scheduler;
+            free(pairs);
+            pthread_rwlock_unlock(&custom_leaf->rwlock);
+            pthread_rwlock_unlock(&ct_tree->rwlock);
+            compaction_scheduler_wait_for_change(scheduler);
+            goto retry_delete;
+        }
+    }
+
     memmove(&pairs[remove_index], &pairs[remove_index + 1],
             (count - (size_t)remove_index - 1) * sizeof(struct kv_pair));
 
@@ -3745,14 +4814,19 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
     bool rebalanced = false;
 
     if (leaf_empty) {
-        struct bplus_leaf *left_leaf = list_is_first(&leaf->link, &ct_tree->tree->list[0])
+        struct compressed_leaf_ref *left_leaf = list_is_first(&leaf->link, &ct_tree->tree->list[0])
                                       ? NULL : list_prev_entry(leaf, link);
-        struct bplus_leaf *right_leaf = list_is_last(&leaf->link, &ct_tree->tree->list[0])
+        struct compressed_leaf_ref *right_leaf = list_is_last(&leaf->link, &ct_tree->tree->list[0])
                                        ? NULL : list_next_entry(leaf, link);
 
-        if (left_leaf && left_leaf->data[0] != 0 && !rebalanced) {
-            struct simple_leaf_node *left_custom = (struct simple_leaf_node *)left_leaf->data[0];
+        if (left_leaf && left_leaf->payload != 0 && !rebalanced) {
+            struct simple_leaf_node *left_custom = (struct simple_leaf_node *)left_leaf->payload;
             pthread_rwlock_wrlock(&left_custom->rwlock);
+            if (left_custom->pending &&
+                pending_task_state_load(left_custom->pending) == PENDING_TASK_FAILED) {
+                free(left_custom->pending);
+                left_custom->pending = NULL;
+            }
             struct kv_pair *left_pairs = NULL;
             size_t left_count = 0;
             if (compressed_leaf_collect_pairs(ct_tree, left_custom, &left_pairs, &left_count) == 0 && left_count > 1) {
@@ -3775,9 +4849,14 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
             pthread_rwlock_unlock(&left_custom->rwlock);
         }
 
-        if (!rebalanced && right_leaf && right_leaf->data[0] != 0) {
-            struct simple_leaf_node *right_custom = (struct simple_leaf_node *)right_leaf->data[0];
+        if (!rebalanced && right_leaf && right_leaf->payload != 0) {
+            struct simple_leaf_node *right_custom = (struct simple_leaf_node *)right_leaf->payload;
             pthread_rwlock_wrlock(&right_custom->rwlock);
+            if (right_custom->pending &&
+                pending_task_state_load(right_custom->pending) == PENDING_TASK_FAILED) {
+                free(right_custom->pending);
+                right_custom->pending = NULL;
+            }
             struct kv_pair *right_pairs = NULL;
             size_t right_count = 0;
             if (compressed_leaf_collect_pairs(ct_tree, right_custom, &right_pairs, &right_count) == 0 && right_count > 1) {
@@ -3808,7 +4887,7 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
     }
 
     if (leaf_empty) {
-        leaf->data[0] = 0;
+        leaf->payload = 0;
         pthread_rwlock_unlock(&custom_leaf->rwlock);
         compressed_leaf_free(custom_leaf);
         remove_leaf_from_parent(ct_tree, leaf);
@@ -3823,6 +4902,19 @@ int bplus_tree_compressed_delete(struct bplus_tree_compressed *ct_tree, key_t ke
     pthread_rwlock_unlock(&custom_leaf->rwlock);
     pthread_rwlock_unlock(&ct_tree->rwlock);
     return 0;
+}
+
+int bplus_tree_compressed_delete(struct bplus_tree_compressed *tree, key_t key)
+{
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    int previous = agg_origin;
+    agg_origin = BPLUS_ORIGIN_DELETE;
+#endif
+    int result = bplus_tree_compressed_delete_impl(tree, key);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    agg_origin = previous;
+#endif
+    return result;
 }
 
 int bplus_tree_compressed_stats(struct bplus_tree_compressed *ct_tree,
@@ -4161,6 +5253,1346 @@ int bplus_tree_compressed_codec_stats(struct bplus_tree_compressed *ct_tree,
     return 0;
 }
 
+static void submission_reset_tree_counters(struct bplus_tree_compressed *ct_tree)
+{
+    if (!ct_tree) {
+        return;
+    }
+    if (compressed_tree_is_sharded(ct_tree)) {
+        for (int i = 0; i < ct_tree->shard_count; i++) {
+            submission_reset_tree_counters(ct_tree->shards[i]);
+        }
+        return;
+    }
+
+    __atomic_store_n(&ct_tree->submission_logical_reads, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_logical_writes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_compress_calls, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_decompress_calls, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_compress_input_bytes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_decompress_input_bytes, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_calls_under_write_lock, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_input_bytes_under_write_lock, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_current_inflight, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ct_tree->submission_peak_inflight, 0, __ATOMIC_RELAXED);
+}
+
+void bplus_tree_compressed_submission_reset(struct bplus_tree_compressed *ct_tree)
+{
+    submission_reset_tree_counters(ct_tree);
+    submission_trace_reset();
+}
+
+int bplus_tree_compressed_submission_stats(
+    struct bplus_tree_compressed *ct_tree,
+    struct bplus_tree_submission_stats *stats)
+{
+    if (!ct_tree || !stats || !ct_tree->initialized) {
+        return -1;
+    }
+    memset(stats, 0, sizeof(*stats));
+
+    if (compressed_tree_is_sharded(ct_tree)) {
+        for (int i = 0; i < ct_tree->shard_count; i++) {
+            struct bplus_tree_submission_stats shard_stats;
+            if (bplus_tree_compressed_submission_stats(ct_tree->shards[i], &shard_stats) != 0) {
+                return -1;
+            }
+            stats->logical_reads += shard_stats.logical_reads;
+            stats->logical_writes += shard_stats.logical_writes;
+            stats->compress_calls += shard_stats.compress_calls;
+            stats->decompress_calls += shard_stats.decompress_calls;
+            stats->compress_input_bytes += shard_stats.compress_input_bytes;
+            stats->decompress_input_bytes += shard_stats.decompress_input_bytes;
+            stats->calls_under_write_lock += shard_stats.calls_under_write_lock;
+            stats->input_bytes_under_write_lock += shard_stats.input_bytes_under_write_lock;
+            stats->current_inflight += shard_stats.current_inflight;
+            if (shard_stats.peak_inflight > stats->peak_inflight) {
+                stats->peak_inflight = shard_stats.peak_inflight;
+            }
+        }
+        return 0;
+    }
+
+    stats->logical_reads = __atomic_load_n(&ct_tree->submission_logical_reads, __ATOMIC_RELAXED);
+    stats->logical_writes = __atomic_load_n(&ct_tree->submission_logical_writes, __ATOMIC_RELAXED);
+    stats->compress_calls = __atomic_load_n(&ct_tree->submission_compress_calls, __ATOMIC_RELAXED);
+    stats->decompress_calls = __atomic_load_n(&ct_tree->submission_decompress_calls, __ATOMIC_RELAXED);
+    stats->compress_input_bytes =
+        __atomic_load_n(&ct_tree->submission_compress_input_bytes, __ATOMIC_RELAXED);
+    stats->decompress_input_bytes =
+        __atomic_load_n(&ct_tree->submission_decompress_input_bytes, __ATOMIC_RELAXED);
+    stats->calls_under_write_lock =
+        __atomic_load_n(&ct_tree->submission_calls_under_write_lock, __ATOMIC_RELAXED);
+    stats->input_bytes_under_write_lock =
+        __atomic_load_n(&ct_tree->submission_input_bytes_under_write_lock, __ATOMIC_RELAXED);
+    stats->current_inflight =
+        __atomic_load_n(&ct_tree->submission_current_inflight, __ATOMIC_RELAXED);
+    stats->peak_inflight =
+        __atomic_load_n(&ct_tree->submission_peak_inflight, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static int compaction_scheduler_enqueue_locked(
+    struct bplus_tree_compressed *tree,
+    struct simple_leaf_node *leaf,
+    struct compressed_pending_task *task)
+{
+    (void)leaf;
+    struct compaction_scheduler *scheduler = tree ? tree->scheduler : NULL;
+    if (!scheduler || !task) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&scheduler->lock);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    if (scheduler->admission_control) {
+        assert(scheduler->admission_reserved > 0);
+        scheduler->admission_reserved--;
+    }
+#endif
+    if (!scheduler->accepting || scheduler->shutdown ||
+        scheduler->queue_count >= scheduler->queue_capacity) {
+        scheduler->queue_full_fallbacks++;
+        pthread_mutex_unlock(&scheduler->lock);
+        return -1;
+    }
+
+    scheduler->queue[scheduler->queue_tail] = task;
+    scheduler->queue_tail = (scheduler->queue_tail + 1) % scheduler->queue_capacity;
+    scheduler->queue_count++;
+    scheduler->submitted_tasks++;
+    if ((uint64_t)scheduler->queue_count > scheduler->queue_peak) {
+        scheduler->queue_peak = (uint64_t)scheduler->queue_count;
+    }
+    pthread_cond_signal(&scheduler->work_available);
+    pthread_mutex_unlock(&scheduler->lock);
+    return 0;
+}
+
+static uint64_t compaction_scheduler_wait_for_change(struct compaction_scheduler *scheduler)
+{
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    uint64_t wait_start = submission_now_ns();
+#endif
+    if (!scheduler) {
+        return 0;
+    }
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 10 * 1000 * 1000;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&scheduler->lock);
+    (void)pthread_cond_timedwait(&scheduler->state_changed, &scheduler->lock, &deadline);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    uint64_t elapsed = submission_now_ns()-wait_start;
+    AGG_INC(pending_wait_ns, elapsed);
+#endif
+    pthread_mutex_unlock(&scheduler->lock);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    return elapsed;
+#else
+    return 0;
+#endif
+}
+
+static void compaction_scheduler_note_completion(struct compaction_scheduler *scheduler,
+                                                 int success,
+                                                 int split)
+{
+    pthread_mutex_lock(&scheduler->lock);
+    if (success) {
+        scheduler->completed_tasks++;
+    } else {
+        scheduler->failed_tasks++;
+    }
+    if (split) {
+        scheduler->split_fallbacks++;
+    }
+    pthread_cond_broadcast(&scheduler->state_changed);
+    pthread_mutex_unlock(&scheduler->lock);
+}
+
+static int compaction_commit_image(struct compaction_scheduler *scheduler,
+                                   struct compressed_pending_task *task,
+                                   struct compressed_page_image *image)
+{
+    struct simple_leaf_node *leaf = task->leaf;
+    int committed = 0;
+    pthread_rwlock_wrlock(&leaf->rwlock);
+    if (leaf->pending == task &&
+        leaf->pending_token == task->token &&
+        leaf->base_version == task->base_version) {
+        leaf_index_adopt(leaf, image->index, image->num_subpages);
+        image->index = NULL;
+        leaf->num_subpages = image->num_subpages;
+        leaf->num_subpage_entries = image->num_subpages;
+        leaf->uncompressed_bytes = image->uncompressed_bytes;
+        compressed_leaf_adopt_base(leaf,
+                                   image->data,
+                                   image->size,
+                                   image->usable);
+        image->data = NULL;
+        leaf->pending = NULL;
+        leaf->generation++;
+        committed = 1;
+    }
+    pthread_rwlock_unlock(&leaf->rwlock);
+
+    if (committed) {
+        __atomic_add_fetch(&task->tree->bg_compactions, 1, __ATOMIC_RELAXED);
+        free(task);
+        compaction_scheduler_note_completion(scheduler, 1, 0);
+    }
+    return committed ? 0 : -1;
+}
+
+static int compaction_split_overflow(struct compaction_scheduler *scheduler,
+                                     struct compressed_pending_task *task)
+{
+    struct bplus_tree_compressed *tree = task->tree;
+    struct compressed_leaf_ref *wrapper = NULL;
+    struct compressed_leaf_ref *new_leaf = NULL;
+    key_t split_key = 0;
+    int result = -1;
+
+    pthread_rwlock_wrlock(&tree->rwlock);
+    if (tree->tree) {
+        struct list_head *head = &tree->tree->list[0];
+        struct list_head *pos, *next;
+        list_for_each_safe(pos, next, head) {
+            struct compressed_leaf_ref *candidate = list_entry(pos, struct compressed_leaf_ref, link);
+            if (candidate->type == BPLUS_TREE_LEAF &&
+                candidate->payload == (value_t)task->leaf) {
+                wrapper = candidate;
+                break;
+            }
+        }
+    }
+
+    if (wrapper && task->leaf->pending == task &&
+        split_leaf(tree, wrapper, &new_leaf, &split_key) == 0 && new_leaf) {
+        result = 0; /* split_leaf publishes both leaves and the reserved parent path. */
+    }
+    pthread_rwlock_unlock(&tree->rwlock);
+
+    if (result == 0) {
+        __atomic_add_fetch(&tree->fg_split_fallbacks, 1, __ATOMIC_RELAXED);
+        free(task);
+        compaction_scheduler_note_completion(scheduler, 1, 1);
+        return 0;
+    }
+
+    pthread_rwlock_wrlock(&task->leaf->rwlock);
+    if (task->leaf->pending == task) {
+        pending_task_state_store(task, PENDING_TASK_FAILED);
+    }
+    pthread_rwlock_unlock(&task->leaf->rwlock);
+    compaction_scheduler_note_completion(scheduler, 0, 1);
+    return -1;
+}
+
+static int compaction_process_task_impl(struct compaction_scheduler *scheduler,
+                                   struct compressed_pending_task *task)
+{
+    struct kv_pair *pairs = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct compressed_page_image image;
+    memset(&image, 0, sizeof(image));
+
+    if (env_bool_enabled("BTREE_TEST_FAIL_CODEC_ALWAYS", 0)) {
+        return -1;
+    }
+    if (env_bool_enabled("BTREE_TEST_FAIL_CODEC_ONCE", 0) &&
+        __atomic_exchange_n(&compaction_test_codec_failure_consumed,
+                            1,
+                            __ATOMIC_RELAXED) == 0) {
+        return -1;
+    }
+
+    if (compressed_leaf_collect_base_pairs(task->tree, task->leaf, &pairs, &count) != 0) {
+        free(pairs);
+        return -1;
+    }
+    capacity = count;
+    for (size_t i = 0; i < task->count; i++) {
+        struct kv_pair *entry = &task->records[i];
+        if (entry->key != 0 &&
+            kv_vector_put(&pairs,
+                          &count,
+                          &capacity,
+                          entry->key,
+                          entry->stored_value,
+                          entry->payload,
+                          COMPRESSED_VALUE_BYTES) != 0) {
+            free(pairs);
+            return -1;
+        }
+    }
+
+    AGG_INC(merged_updates, task->count);
+    AGG_INC(merge_count, 1);
+    int build = compressed_build_base_image(task->tree, task->leaf, pairs, count, &image);
+    free(pairs);
+    if (build == -2) {
+        compressed_page_image_destroy(&image);
+        return compaction_split_overflow(scheduler, task);
+    }
+    if (build != 0) {
+        compressed_page_image_destroy(&image);
+        return -1;
+    }
+
+    int commit = compaction_commit_image(scheduler, task, &image);
+    compressed_page_image_destroy(&image);
+    return commit;
+}
+
+static int compaction_process_task(struct compaction_scheduler *scheduler,
+                                   struct compressed_pending_task *task)
+{
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    int previous = agg_origin;
+    agg_origin = BPLUS_ORIGIN_COMPACTION;
+#endif
+    int result = compaction_process_task_impl(scheduler, task);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    agg_origin = previous;
+#endif
+    return result;
+}
+
+/*
+ * Use one reusable QPL job per leaf in the batch.  This path is deliberately
+ * limited to the v1 4 KiB/one-subpage representation.  Other codecs and
+ * legacy multi-subpage configurations use the same scheduler but execute the
+ * existing codec helper sequentially outside the leaf write lock.
+ *
+ * Return 1 when every task in the batch was handled (committed, split,
+ * retried, or marked failed), and 0 when the batch is not eligible.
+ */
+static void codec_contract_complete(struct compaction_scheduler *scheduler, int i)
+{
+    struct codec_async_slot *slot = &scheduler->codec_slots[i];
+    assert(slot->accepted && !slot->terminal);
+    int produced = -1;
+    if (scheduler->contract_mode != 4) {
+        produced = slot->op == qpl_op_compress
+            ? compress_subpage_impl(slot->task->tree, slot->task->leaf,
+                slot->next_in_ptr, slot->available_in, slot->next_out_ptr, slot->available_out)
+            : decompress_subpage_impl(slot->task->tree, slot->task->leaf,
+                slot->next_in_ptr, slot->available_in, slot->next_out_ptr, slot->available_out);
+    }
+    slot->total_out = scheduler->contract_mode == 5 ? slot->available_out + 1 :
+        (produced > 0 ? (uint32_t)produced : 0);
+    slot->result = produced > 0 ? QPL_STS_OK : QPL_STS_NOT_SUPPORTED_MODE_ERR;
+    for (int j = 0; j < scheduler->batch_size; j++) {
+        struct codec_async_slot *other = &scheduler->codec_slots[j];
+        if (other->accepted && !other->terminal && other->sequence < slot->sequence) {
+            scheduler->contract_stats.out_of_order++;
+            break;
+        }
+    }
+    slot->terminal = 1;
+    scheduler->contract_stats.terminal++;
+    scheduler->contract_stats.in_flight--;
+    if (slot->result != QPL_STS_OK || scheduler->contract_mode == 5)
+        scheduler->contract_stats.failures++;
+    pthread_cond_broadcast(&scheduler->state_changed);
+}
+
+static qpl_status codec_backend_submit(struct compaction_scheduler *scheduler, int i)
+{
+    struct codec_async_slot *slot = &scheduler->codec_slots[i];
+    if (!scheduler->contract_mode) {
+        qpl_job *job = scheduler->qpl_jobs[i];
+        job->op = slot->op;
+        job->next_in_ptr = slot->next_in_ptr; job->available_in = slot->available_in;
+        job->next_out_ptr = slot->next_out_ptr; job->available_out = slot->available_out;
+        job->total_in = job->total_out = 0;
+        job->flags = slot->flags; job->level = slot->level;
+        qpl_status result = qpl_submit_job(job);
+        pthread_mutex_lock(&scheduler->lock);
+        if (result == QPL_STS_OK) {
+            scheduler->contract_stats.accepted++;
+            scheduler->contract_stats.in_flight++;
+        }
+#ifdef HAVE_QPL
+        if (result == QPL_STS_QUEUES_ARE_BUSY_ERR) scheduler->contract_stats.busy++;
+#endif
+        pthread_mutex_unlock(&scheduler->lock);
+        return result;
+    }
+    pthread_mutex_lock(&scheduler->lock);
+    assert(!slot->accepted || slot->terminal);
+    if (scheduler->contract_mode == 3 && !scheduler->contract_stats.busy) {
+        scheduler->contract_stats.busy++;
+        pthread_mutex_unlock(&scheduler->lock);
+        return QPL_STS_NOT_SUPPORTED_MODE_ERR; /* Rejected, not an accepted job. */
+    }
+    slot->accepted = 1; slot->terminal = 0;
+    slot->sequence = ++scheduler->contract_stats.accepted;
+    scheduler->contract_stats.in_flight++;
+    if (scheduler->contract_mode == 1) codec_contract_complete(scheduler, i);
+    pthread_cond_broadcast(&scheduler->state_changed);
+    pthread_mutex_unlock(&scheduler->lock);
+    return QPL_STS_OK;
+}
+
+static qpl_status codec_backend_wait(struct compaction_scheduler *scheduler, int i)
+{
+    pthread_mutex_lock(&scheduler->lock);
+    if (scheduler->queue_count) scheduler->ready_at_wait_samples++;
+    pthread_mutex_unlock(&scheduler->lock);
+    if (!scheduler->contract_mode) {
+        qpl_status result = qpl_wait_job(scheduler->qpl_jobs[i]);
+        scheduler->codec_slots[i].total_out = scheduler->qpl_jobs[i]->total_out;
+        pthread_mutex_lock(&scheduler->lock);
+        scheduler->contract_stats.terminal++;
+        scheduler->contract_stats.in_flight--;
+        if (result != QPL_STS_OK) scheduler->contract_stats.failures++;
+        pthread_mutex_unlock(&scheduler->lock);
+        return result;
+    }
+    pthread_mutex_lock(&scheduler->lock);
+    while (!scheduler->contract_gate_open && !scheduler->shutdown)
+        pthread_cond_wait(&scheduler->state_changed, &scheduler->lock);
+    /* Deterministic completion events, not simulated device service times. */
+    for (int j = scheduler->batch_size - 1; j >= 0; j--) {
+        struct codec_async_slot *slot = &scheduler->codec_slots[j];
+        if (slot->accepted && !slot->terminal) codec_contract_complete(scheduler, j);
+    }
+    qpl_status result = scheduler->codec_slots[i].result;
+    pthread_mutex_unlock(&scheduler->lock);
+    return result;
+}
+
+int bplus_tree_compressed_test_contract(struct bplus_tree_compressed *tree, int gate_open,
+                                       struct bplus_tree_contract_stats *stats)
+{
+    struct compaction_scheduler *scheduler = tree ? tree->scheduler : NULL;
+    if (!scheduler) return -1;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    if (!scheduler->contract_mode && !scheduler->split_test_mode) return -1;
+#else
+    if (!scheduler->contract_mode) return -1;
+#endif
+    pthread_mutex_lock(&scheduler->lock);
+    if (gate_open >= 0) scheduler->contract_gate_open = !!gate_open;
+    if (stats) *stats = scheduler->contract_stats;
+    pthread_cond_broadcast(&scheduler->state_changed);
+    pthread_mutex_unlock(&scheduler->lock);
+    return 0;
+}
+
+static int compaction_process_codec_batch(struct compaction_scheduler *scheduler,
+                                        struct compressed_pending_task **batch,
+                                        int count)
+{
+#if ZIPCACHE_AGG_LAYOUT > 0
+    /* The legacy adapter emits unframed full pages. A format-aware asynchronous
+     * adapter is a later, capacity-gated experiment, not an implicit fallback. */
+    return 0;
+#endif
+    if (!scheduler || !batch || count <= 0 ||
+        !scheduler->codec_slots || (!scheduler->contract_mode && scheduler->qpl_job_count < count)) {
+        return 0;
+    }
+
+    for (int i = 0; i < count; i++) {
+        struct compressed_pending_task *task = batch[i];
+        if (!task || !task->tree || !task->leaf ||
+            (!scheduler->contract_mode && task->leaf->compression_algo != COMPRESS_QPL) ||
+            task->leaf->num_subpages != 1) {
+            return 0;
+        }
+    }
+
+    struct kv_pair **pairs = calloc((size_t)count, sizeof(*pairs));
+    size_t *pair_counts = calloc((size_t)count, sizeof(*pair_counts));
+    size_t *pair_capacities = calloc((size_t)count, sizeof(*pair_capacities));
+    int *submitted = calloc((size_t)count, sizeof(*submitted));
+    int *profiled = calloc((size_t)count, sizeof(*profiled));
+    int *overflow = calloc((size_t)count, sizeof(*overflow));
+    struct compressed_page_image *images = calloc((size_t)count, sizeof(*images));
+    if (env_bool_enabled("BTREE_TEST_FAIL_BATCH_ALLOC", 0)) { free(submitted); submitted = NULL; }
+    int batch_error = (!pairs || !pair_counts || !pair_capacities ||
+                       !submitted || !profiled || !overflow || !images);
+
+    memset(scheduler->raw_workspaces,
+           0,
+           (size_t)count * COMPRESSED_LEAF_SIZE);
+
+    uint64_t phase_start = submission_now_ns();
+    /* Phase 1: submit every base decompression before waiting for any one. */
+    for (int i = 0; i < count && !batch_error; i++) {
+        struct compressed_pending_task *task = batch[i];
+        struct simple_leaf_node *leaf = task->leaf;
+        uint8_t *raw = scheduler->raw_workspaces + (size_t)i * COMPRESSED_LEAF_SIZE;
+        const uint8_t *source = NULL;
+        uint32_t source_size = 0;
+
+        pthread_rwlock_rdlock(&leaf->rwlock);
+        if (leaf->pending != task || leaf->pending_token != task->token ||
+            leaf->base_version != task->base_version) {
+            batch_error = 1;
+        } else if (leaf->is_compressed && leaf->compressed_data &&
+                   leaf->subpage_index && leaf->subpage_index[0].length > 0) {
+            source = (const uint8_t *)leaf->compressed_data + leaf->subpage_index[0].offset;
+            source_size = leaf->subpage_index[0].length;
+        }
+        pthread_rwlock_unlock(&leaf->rwlock);
+        if (batch_error || source_size == 0) {
+            continue;
+        }
+
+        struct codec_async_slot *job = &scheduler->codec_slots[i];
+        job->task = task;
+        job->op = qpl_op_decompress;
+        job->next_in_ptr = (uint8_t *)source;
+        job->available_in = source_size;
+        job->total_in = 0;
+        job->next_out_ptr = raw;
+        job->available_out = COMPRESSED_LEAF_SIZE;
+        job->total_out = 0;
+        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+        profiled[i] = submission_profile_codec_begin(task->tree,
+                                                     0,
+                                                     source_size,
+                                                     COMPRESSED_LEAF_SIZE,
+                                                     leaf);
+        __atomic_add_fetch(&task->tree->qpl_decompress_calls, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&task->tree->qpl_pool_jobs, 1, __ATOMIC_RELAXED);
+        qpl_status status = codec_backend_submit(scheduler, i);
+        if (status != QPL_STS_OK) {
+            submission_profile_codec_end(task->tree, profiled[i]);
+            profiled[i] = 0;
+            __atomic_add_fetch(&task->tree->qpl_errors, 1, __ATOMIC_RELAXED);
+            batch_error = 1;
+            break;
+        }
+        submitted[i] = 1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (!submitted || !submitted[i]) {
+            continue;
+        }
+        qpl_status status = codec_backend_wait(scheduler, i);
+        submission_profile_codec_end(batch[i]->tree, profiled[i]);
+        profiled[i] = 0;
+        if (status != QPL_STS_OK || scheduler->codec_slots[i].total_out != COMPRESSED_LEAF_SIZE) {
+            __atomic_add_fetch(&batch[i]->tree->qpl_errors, 1, __ATOMIC_RELAXED);
+            batch_error = 1;
+        }
+    }
+
+    uint64_t phase_now = submission_now_ns();
+    pthread_mutex_lock(&scheduler->lock);
+    scheduler->decompress_phase_ns += phase_now - phase_start;
+    pthread_mutex_unlock(&scheduler->lock);
+    phase_start = phase_now;
+    /* CPU merge: pending overwrites the immutable base. */
+    for (int i = 0; i < count && !batch_error; i++) {
+        uint8_t *raw = scheduler->raw_workspaces + (size_t)i * COMPRESSED_LEAF_SIZE;
+        struct kv_pair *slots = (struct kv_pair *)(void *)raw;
+        size_t slot_count = COMPRESSED_LEAF_SIZE / sizeof(struct kv_pair);
+        for (size_t j = 0; j < slot_count; j++) {
+            if (slots[j].key != 0 &&
+                kv_vector_put(&pairs[i],
+                              &pair_counts[i],
+                              &pair_capacities[i],
+                              slots[j].key,
+                              slots[j].stored_value,
+                              slots[j].payload,
+                              COMPRESSED_VALUE_BYTES) != 0) {
+                batch_error = 1;
+                break;
+            }
+        }
+        for (size_t j = 0; j < batch[i]->count && !batch_error; j++) {
+            struct kv_pair *entry = &batch[i]->records[j];
+            if (entry->key != 0 &&
+                kv_vector_put(&pairs[i],
+                              &pair_counts[i],
+                              &pair_capacities[i],
+                              entry->key,
+                              entry->stored_value,
+                              entry->payload,
+                              COMPRESSED_VALUE_BYTES) != 0) {
+                batch_error = 1;
+            }
+        }
+        if (batch_error) {
+            break;
+        }
+
+        qsort(pairs[i], pair_counts[i], sizeof(struct kv_pair), compare_kv_pairs);
+        memset(raw, 0, COMPRESSED_LEAF_SIZE);
+        slots = (struct kv_pair *)(void *)raw;
+        for (size_t j = 0; j < pair_counts[i]; j++) {
+            if (j >= slot_count) {
+                overflow[i] = 1;
+                break;
+            }
+            slots[j] = pairs[i][j];
+        }
+    }
+
+    memset(scheduler->compressed_workspaces,
+           0,
+           (size_t)count * MAX_COMPRESSED_SIZE);
+    if (submitted) memset(submitted, 0, (size_t)count * sizeof(*submitted));
+
+    phase_now = submission_now_ns();
+    pthread_mutex_lock(&scheduler->lock);
+    scheduler->merge_phase_ns += phase_now - phase_start;
+    pthread_mutex_unlock(&scheduler->lock);
+    phase_start = phase_now;
+    /* Phase 2: submit every merged-page compression, then wait as a group. */
+    for (int i = 0; i < count && !batch_error; i++) {
+        if (overflow[i]) {
+            continue;
+        }
+        struct compressed_pending_task *task = batch[i];
+        uint8_t *raw = scheduler->raw_workspaces + (size_t)i * COMPRESSED_LEAF_SIZE;
+        uint8_t *compressed = scheduler->compressed_workspaces +
+                              (size_t)i * MAX_COMPRESSED_SIZE;
+        struct codec_async_slot *job = &scheduler->codec_slots[i];
+        job->task = task;
+        job->op = qpl_op_compress;
+        job->next_in_ptr = raw;
+        job->available_in = COMPRESSED_LEAF_SIZE;
+        job->total_in = 0;
+        job->next_out_ptr = compressed;
+        job->available_out = MAX_COMPRESSED_SIZE;
+        job->total_out = 0;
+        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+        if (task->tree->config.qpl_huffman_mode == QPL_HUFFMAN_DYNAMIC) {
+            job->flags |= QPL_FLAG_DYNAMIC_HUFFMAN;
+        }
+        job->level = qpl_default_level;
+        profiled[i] = submission_profile_codec_begin(task->tree,
+                                                     1,
+                                                     COMPRESSED_LEAF_SIZE,
+                                                     MAX_COMPRESSED_SIZE,
+                                                     task->leaf);
+        __atomic_add_fetch(&task->tree->qpl_compress_calls, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&task->tree->qpl_pool_jobs, 1, __ATOMIC_RELAXED);
+        qpl_status status = codec_backend_submit(scheduler, i);
+        if (status != QPL_STS_OK) {
+            submission_profile_codec_end(task->tree, profiled[i]);
+            profiled[i] = 0;
+            __atomic_add_fetch(&task->tree->qpl_errors, 1, __ATOMIC_RELAXED);
+            batch_error = 1;
+            break;
+        }
+        submitted[i] = 1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (!submitted || !submitted[i]) {
+            continue;
+        }
+        qpl_status status = codec_backend_wait(scheduler, i);
+        submission_profile_codec_end(batch[i]->tree, profiled[i]);
+        profiled[i] = 0;
+        uint32_t produced = scheduler->codec_slots[i].total_out;
+        if (status != QPL_STS_OK || produced == 0 || produced > MAX_COMPRESSED_SIZE) {
+            __atomic_add_fetch(&batch[i]->tree->qpl_errors, 1, __ATOMIC_RELAXED);
+            batch_error = 1;
+            continue;
+        }
+
+        images[i].data = malloc(produced);
+        images[i].index = calloc(1, sizeof(*images[i].index));
+        if (!images[i].data || !images[i].index) {
+            batch_error = 1;
+            continue;
+        }
+        memcpy(images[i].data,
+               scheduler->compressed_workspaces + (size_t)i * MAX_COMPRESSED_SIZE,
+               produced);
+        images[i].size = produced;
+        images[i].usable = allocation_usable_size(images[i].data, produced);
+        images[i].num_subpages = 1;
+        images[i].uncompressed_bytes = pair_counts[i] * sizeof(struct kv_pair);
+        images[i].index[0].offset = 0;
+        images[i].index[0].length = produced;
+        images[i].index[0].uncompressed_bytes = COMPRESSED_LEAF_SIZE;
+    }
+
+    phase_now = submission_now_ns();
+    pthread_mutex_lock(&scheduler->lock);
+    scheduler->compress_phase_ns += phase_now - phase_start;
+    pthread_mutex_unlock(&scheduler->lock);
+    phase_start = phase_now;
+    if (batch_error) {
+        for (int i = 0; i < count; i++) {
+            free(pairs ? pairs[i] : NULL);
+            if (images) {
+                compressed_page_image_destroy(&images[i]);
+            }
+        }
+        free(pairs);
+        free(pair_counts);
+        free(pair_capacities);
+        free(submitted);
+        free(profiled);
+        free(overflow);
+        free(images);
+
+        /*
+         * auto path gets its same-format QPL software fallback through
+         * the existing codec helper; strict hardware returns an error and the
+         * task-level retry policy below applies.
+         */
+        for (int i = 0; i < count; i++) {
+            if (scheduler->contract_mode) {
+                compaction_fail_or_retry(scheduler, batch[i]);
+                continue;
+            }
+            if (compaction_process_task(scheduler, batch[i]) != 0 &&
+                pending_task_state_load(batch[i]) != PENDING_TASK_FAILED) {
+                compaction_fail_or_retry(scheduler, batch[i]);
+            }
+        }
+        return 1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        free(pairs[i]);
+        if (overflow[i]) {
+            (void)compaction_split_overflow(scheduler, batch[i]);
+            continue;
+        }
+        if (compaction_commit_image(scheduler, batch[i], &images[i]) != 0 &&
+            pending_task_state_load(batch[i]) != PENDING_TASK_FAILED) {
+            compaction_fail_or_retry(scheduler, batch[i]);
+        }
+        compressed_page_image_destroy(&images[i]);
+    }
+
+    free(pairs);
+    free(pair_counts);
+    free(pair_capacities);
+    free(submitted);
+    free(profiled);
+    free(overflow);
+    free(images);
+    pthread_mutex_lock(&scheduler->lock);
+    scheduler->commit_phase_ns += submission_now_ns() - phase_start;
+    pthread_mutex_unlock(&scheduler->lock);
+    return 1;
+}
+
+static void compaction_fail_or_retry(struct compaction_scheduler *scheduler,
+                                     struct compressed_pending_task *task)
+{
+    task->attempts++;
+    pthread_mutex_lock(&scheduler->lock);
+    if (!scheduler->shutdown && task->attempts < 2 &&
+        scheduler->queue_count
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+            + (int)scheduler->admission_reserved
+#endif
+            < scheduler->queue_capacity) {
+        pending_task_state_store(task, PENDING_TASK_QUEUED);
+        scheduler->queue[scheduler->queue_tail] = task;
+        scheduler->queue_tail = (scheduler->queue_tail + 1) % scheduler->queue_capacity;
+        scheduler->queue_count++;
+        scheduler->retry_count++;
+        pthread_cond_signal(&scheduler->work_available);
+        pthread_mutex_unlock(&scheduler->lock);
+        return;
+    }
+    pthread_mutex_unlock(&scheduler->lock);
+
+    pthread_rwlock_wrlock(&task->leaf->rwlock);
+    if (task->leaf->pending == task) {
+        pending_task_state_store(task, PENDING_TASK_FAILED);
+    }
+    pthread_rwlock_unlock(&task->leaf->rwlock);
+    compaction_scheduler_note_completion(scheduler, 0, 0);
+}
+
+static void *compaction_scheduler_worker(void *argument)
+{
+    struct compaction_scheduler *scheduler = argument;
+    struct compressed_pending_task *batch[32] = {0};
+
+    for (;;) {
+        int count = 0;
+        pthread_mutex_lock(&scheduler->lock);
+        while (scheduler->queue_count == 0 && !scheduler->shutdown) {
+            pthread_cond_wait(&scheduler->work_available, &scheduler->lock);
+        }
+        if (scheduler->queue_count == 0 && scheduler->shutdown) {
+            pthread_mutex_unlock(&scheduler->lock);
+            break;
+        }
+        while (count < scheduler->batch_size && scheduler->queue_count > 0) {
+            struct compressed_pending_task *task = scheduler->queue[scheduler->queue_head];
+            scheduler->queue[scheduler->queue_head] = NULL;
+            scheduler->queue_head = (scheduler->queue_head + 1) % scheduler->queue_capacity;
+            scheduler->queue_count--;
+            pending_task_state_store(task, PENDING_TASK_RUNNING);
+            batch[count++] = task;
+            scheduler->running_count++;
+
+            uint64_t waited = submission_now_ns() - task->enqueued_ns;
+            scheduler->total_queue_wait_ns += waited;
+            AGG_INC(queue_wait_ns, waited);
+            if (waited > scheduler->max_queue_wait_ns) {
+                scheduler->max_queue_wait_ns = waited;
+            }
+        }
+        scheduler->batches++;
+        pthread_cond_broadcast(&scheduler->state_changed);
+        pthread_mutex_unlock(&scheduler->lock);
+
+        int test_delay_us = env_int_clamped("BTREE_TEST_WORKER_DELAY_US", 0, 0, 1000000);
+        if (test_delay_us > 0) {
+            usleep((useconds_t)test_delay_us);
+        }
+
+        submission_tls_write_critical = 0;
+        int qpl_handled = compaction_process_codec_batch(scheduler, batch, count);
+        for (int i = 0; i < count; i++) {
+            if (!qpl_handled &&
+                compaction_process_task(scheduler, batch[i]) != 0 &&
+                pending_task_state_load(batch[i]) != PENDING_TASK_FAILED) {
+                compaction_fail_or_retry(scheduler, batch[i]);
+            }
+            pthread_mutex_lock(&scheduler->lock);
+            scheduler->running_count--;
+            pthread_cond_broadcast(&scheduler->state_changed);
+            pthread_mutex_unlock(&scheduler->lock);
+            batch[i] = NULL;
+        }
+    }
+
+    return NULL;
+}
+
+static void compaction_scheduler_release_qpl_jobs(struct compaction_scheduler *scheduler)
+{
+    if (!scheduler) {
+        return;
+    }
+    assert(!scheduler->contract_stats.in_flight &&
+           scheduler->contract_stats.accepted == scheduler->contract_stats.terminal);
+    for (int i = 0; i < scheduler->batch_size; i++) {
+        if (scheduler->qpl_jobs && scheduler->qpl_jobs[i]) {
+            qpl_fini_job(scheduler->qpl_jobs[i]);
+        }
+        free(scheduler->qpl_job_buffers ? scheduler->qpl_job_buffers[i] : NULL);
+    }
+    free(scheduler->qpl_jobs);
+    free(scheduler->qpl_job_buffers);
+    free(scheduler->codec_slots);
+    scheduler->codec_slots = NULL;
+    scheduler->qpl_jobs = NULL;
+    scheduler->qpl_job_buffers = NULL;
+    scheduler->qpl_job_count = 0;
+    scheduler->qpl_job_bytes = 0;
+}
+
+static int compaction_scheduler_init_qpl_jobs(struct compaction_scheduler *scheduler)
+{
+#if ZIPCACHE_AGG_LAYOUT > 0
+    /* Framed layouts run synchronous per-task transforms using worker TLS.
+     * Do not reserve unused legacy batch jobs, especially for a different path. */
+    (void)scheduler;
+    return 0;
+#endif
+    if (!scheduler || !scheduler->root ||
+        scheduler->root->config.algo != COMPRESS_QPL) {
+        return 0;
+    }
+
+    uint32_t job_size = 0;
+    qpl_status status = qpl_get_job_size(scheduler->root->config.qpl_path, &job_size);
+    if (status != QPL_STS_OK || job_size == 0) {
+        return -1;
+    }
+
+    scheduler->qpl_jobs = calloc((size_t)scheduler->batch_size,
+                                 sizeof(*scheduler->qpl_jobs));
+    scheduler->qpl_job_buffers = calloc((size_t)scheduler->batch_size,
+                                        sizeof(*scheduler->qpl_job_buffers));
+    if (!scheduler->qpl_jobs || !scheduler->qpl_job_buffers) {
+        goto fail;
+    }
+
+    for (int i = 0; i < scheduler->batch_size; i++) {
+        scheduler->qpl_job_buffers[i] = malloc(job_size);
+        if (!scheduler->qpl_job_buffers[i]) {
+            goto fail;
+        }
+        scheduler->qpl_jobs[i] = (qpl_job *)scheduler->qpl_job_buffers[i];
+        status = qpl_init_job(scheduler->root->config.qpl_path, scheduler->qpl_jobs[i]);
+        if (status != QPL_STS_OK) {
+            scheduler->qpl_jobs[i] = NULL;
+            goto fail;
+        }
+        scheduler->qpl_job_count++;
+        scheduler->qpl_job_bytes += job_size;
+    }
+    return 0;
+
+fail:
+    compaction_scheduler_release_qpl_jobs(scheduler);
+    return -1;
+}
+
+static struct compaction_scheduler *compaction_scheduler_create(
+    struct bplus_tree_compressed *root)
+{
+    if (!root || !env_bool_enabled("BTREE_BG_COMPACTION", 0)) {
+        return NULL;
+    }
+
+    struct compaction_scheduler *scheduler = calloc(1, sizeof(*scheduler));
+    if (!scheduler) {
+        return NULL;
+    }
+    scheduler->root = root;
+    scheduler->contract_mode = env_int_clamped("BTREE_TEST_CONTRACT_MODE", 0, 0, 5);
+    scheduler->contract_gate_open = !env_bool_enabled("BTREE_TEST_CONTRACT_CLOSED", 0);
+    if (scheduler->contract_mode && root->config.algo != COMPRESS_LZ4 &&
+        root->config.algo != COMPRESS_ZLIB_ACCEL) { free(scheduler); return NULL; }
+    scheduler->batch_size = env_int_clamped("BTREE_BG_BATCH_SIZE", 8, 1, 32);
+    scheduler->queue_capacity = env_int_clamped("BTREE_BG_QUEUE_CAPACITY", 32, 1, 4096);
+    if (scheduler->queue_capacity < scheduler->batch_size) {
+        scheduler->queue_capacity = scheduler->batch_size;
+    }
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    scheduler->split_test_mode = env_int_clamped("BTREE_TEST_SPLIT_CODEC_MODE", 0, 0, 5);
+    scheduler->admission_control = env_bool_enabled("BTREE_AGG_BACKPRESSURE", 0);
+    scheduler->pending_charge = sizeof(struct compressed_pending_task) +
+        (ACTIVE_DELTA_ENTRIES+1)*sizeof(struct kv_pair);
+    scheduler->pending_byte_limit = (size_t)env_int_clamped("BTREE_AGG_PENDING_BYTES",
+        (int)((scheduler->queue_capacity+scheduler->batch_size)*scheduler->pending_charge), 0, INT_MAX);
+#endif
+    scheduler->queue = calloc((size_t)scheduler->queue_capacity, sizeof(*scheduler->queue));
+    scheduler->raw_workspaces = calloc((size_t)scheduler->batch_size, COMPRESSED_LEAF_SIZE);
+    scheduler->compressed_workspaces = calloc((size_t)scheduler->batch_size, MAX_COMPRESSED_SIZE);
+    if (!scheduler->queue || !scheduler->raw_workspaces || !scheduler->compressed_workspaces) {
+        free(scheduler->queue);
+        free(scheduler->raw_workspaces);
+        free(scheduler->compressed_workspaces);
+        free(scheduler);
+        return NULL;
+    }
+
+    pthread_mutex_init(&scheduler->lock, NULL);
+    pthread_cond_init(&scheduler->work_available, NULL);
+    pthread_cond_init(&scheduler->state_changed, NULL);
+    int qpl_init_result = scheduler->contract_mode ? 0 : compaction_scheduler_init_qpl_jobs(scheduler);
+    if (!qpl_init_result && (scheduler->contract_mode || scheduler->qpl_job_count)) {
+        scheduler->codec_slots = calloc((size_t)scheduler->batch_size, sizeof(*scheduler->codec_slots));
+        if (!scheduler->codec_slots) qpl_init_result = -1;
+    }
+    if (qpl_init_result != 0 &&
+        (scheduler->contract_mode || (root->config.algo == COMPRESS_QPL &&
+        root->config.qpl_path == qpl_path_hardware))) {
+        compaction_scheduler_release_qpl_jobs(scheduler);
+        pthread_cond_destroy(&scheduler->state_changed);
+        pthread_cond_destroy(&scheduler->work_available);
+        pthread_mutex_destroy(&scheduler->lock);
+        free(scheduler->queue);
+        free(scheduler->raw_workspaces);
+        free(scheduler->compressed_workspaces);
+        free(scheduler);
+        return NULL;
+    }
+    scheduler->accepting = 1;
+    pthread_attr_t worker_attr;
+    pthread_attr_init(&worker_attr);
+    int start_error = 0;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    scheduler->worker_stack_bytes = 512*1024 + page;
+    scheduler->worker_stack = malloc(scheduler->worker_stack_bytes);
+    if (!scheduler->worker_stack) start_error = ENOMEM;
+    else {
+        memset(scheduler->worker_stack, 0, scheduler->worker_stack_bytes);
+        uintptr_t base = ((uintptr_t)scheduler->worker_stack+page-1) & ~(uintptr_t)(page-1);
+        start_error = pthread_attr_setstack(&worker_attr, (void *)base, 512*1024);
+    }
+#endif
+    if (!start_error) start_error = pthread_create(&scheduler->worker, &worker_attr, compaction_scheduler_worker, scheduler);
+    pthread_attr_destroy(&worker_attr);
+    if (start_error) {
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        free(scheduler->worker_stack);
+#endif
+        compaction_scheduler_release_qpl_jobs(scheduler);
+        pthread_cond_destroy(&scheduler->state_changed);
+        pthread_cond_destroy(&scheduler->work_available);
+        pthread_mutex_destroy(&scheduler->lock);
+        free(scheduler->queue);
+        free(scheduler->raw_workspaces);
+        free(scheduler->compressed_workspaces);
+        free(scheduler);
+        return NULL;
+    }
+    scheduler->started = 1;
+    return scheduler;
+}
+
+static void compaction_scheduler_attach(struct bplus_tree_compressed *tree,
+                                        struct compaction_scheduler *scheduler,
+                                        int owner)
+{
+    if (!tree) {
+        return;
+    }
+    tree->scheduler = scheduler;
+    tree->owns_scheduler = owner;
+    tree->bg_compaction_enabled = scheduler != NULL;
+    tree->bg_thread_count = scheduler ? 1 : 0;
+    tree->bg_queue_capacity = scheduler ? scheduler->queue_capacity : 0;
+    if (scheduler) {
+        /* v1 async semantics require all three active slots, regardless of a
+         * deprecated landing-buffer environment value. */
+        tree->config.buffer_size = LANDING_BUFFER_BYTES;
+        tree->simple_config.buffer_size = LANDING_BUFFER_BYTES;
+    }
+    if (compressed_tree_is_sharded(tree)) {
+        for (int i = 0; i < tree->shard_count; i++) {
+            compaction_scheduler_attach(tree->shards[i], scheduler, 0);
+        }
+    }
+}
+
+static void compaction_scheduler_destroy(struct compaction_scheduler *scheduler)
+{
+    if (!scheduler) {
+        return;
+    }
+    pthread_mutex_lock(&scheduler->lock);
+    scheduler->accepting = 0;
+    scheduler->shutdown = 1;
+    pthread_cond_broadcast(&scheduler->work_available);
+    pthread_cond_broadcast(&scheduler->state_changed);
+    pthread_mutex_unlock(&scheduler->lock);
+
+    if (scheduler->started) {
+        pthread_join(scheduler->worker, NULL);
+    }
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    free(scheduler->worker_stack);
+#endif
+    compaction_scheduler_release_qpl_jobs(scheduler);
+    free(scheduler->queue);
+    free(scheduler->raw_workspaces);
+    free(scheduler->compressed_workspaces);
+    pthread_cond_destroy(&scheduler->state_changed);
+    pthread_cond_destroy(&scheduler->work_available);
+    pthread_mutex_destroy(&scheduler->lock);
+    free(scheduler);
+}
+
+static int compressed_pending_status(struct bplus_tree_compressed *tree)
+{
+    if (compressed_tree_is_sharded(tree)) {
+        for (int i = 0; i < tree->shard_count; i++)
+            if (compressed_pending_status(tree->shards[i])) return -1;
+        return 0;
+    }
+    int result = 0;
+    pthread_rwlock_rdlock(&tree->rwlock);
+    struct list_head *pos, *next;
+    list_for_each_safe(pos, next, &tree->tree->list[0]) {
+        struct compressed_leaf_ref *ref = list_entry(pos, struct compressed_leaf_ref, link);
+        struct simple_leaf_node *leaf = (struct simple_leaf_node *)ref->payload;
+        if (!leaf) continue;
+        pthread_rwlock_rdlock(&leaf->rwlock);
+        if (leaf->pending) result = -1;
+        pthread_rwlock_unlock(&leaf->rwlock);
+    }
+    pthread_rwlock_unlock(&tree->rwlock);
+    return result;
+}
+
+int bplus_tree_compressed_drain_background(struct bplus_tree_compressed *ct_tree)
+{
+    if (!ct_tree || !ct_tree->initialized) {
+        return -1;
+    }
+    struct compaction_scheduler *scheduler = ct_tree->scheduler;
+    if (!scheduler) {
+        return 0;
+    }
+    pthread_mutex_lock(&scheduler->lock);
+    while (scheduler->queue_count > 0 || scheduler->running_count > 0) {
+        pthread_cond_wait(&scheduler->state_changed, &scheduler->lock);
+    }
+    pthread_mutex_unlock(&scheduler->lock);
+    /* Caller quiesces producers. An empty queue is not a successful drain
+     * when a permanently failed task is still the authoritative delta. */
+    return compressed_pending_status(ct_tree);
+}
+
+static int compressed_memory_stats_collect(struct bplus_tree_compressed *ct_tree,
+                                           struct bplus_tree_memory_stats *stats,
+                                           int (*visitor)(const struct kv_pair *, void *),
+                                           void *context)
+{
+    if (!ct_tree || !stats || !ct_tree->initialized) {
+        return -1;
+    }
+
+    stats->tree_metadata_bytes += sizeof(*ct_tree);
+    stats->tree_metadata_usable_bytes += allocation_usable_size(ct_tree, sizeof(*ct_tree));
+    if (compressed_tree_is_sharded(ct_tree)) {
+        stats->tree_metadata_bytes +=
+            (size_t)ct_tree->shard_count * sizeof(*ct_tree->shards);
+        stats->tree_metadata_usable_bytes += allocation_usable_size(ct_tree->shards,
+            (size_t)ct_tree->shard_count * sizeof(*ct_tree->shards));
+        for (int i = 0; i < ct_tree->shard_count; i++) {
+            if (compressed_memory_stats_collect(ct_tree->shards[i], stats, visitor, context) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    stats->scheduler_and_qpl_bytes += ct_tree->qpl_pool_bytes;
+    if (ct_tree->qpl_pool_size) {
+        size_t n = (size_t)ct_tree->qpl_pool_size;
+        stats->scheduler_and_qpl_usable_bytes +=
+            allocation_usable_size(ct_tree->qpl_job_pool, n * sizeof(qpl_job *)) +
+            allocation_usable_size(ct_tree->qpl_job_buffers, n * sizeof(uint8_t *)) +
+            allocation_usable_size(ct_tree->qpl_job_free_list, n * sizeof(int));
+        for (int i = 0; i < ct_tree->qpl_pool_size; i++)
+            stats->scheduler_and_qpl_usable_bytes += allocation_usable_size(
+                ct_tree->qpl_job_buffers[i], 0);
+    }
+    if (!ct_tree->tree) {
+        return 0;
+    }
+
+    stats->tree_metadata_bytes += sizeof(*ct_tree->tree);
+    stats->tree_metadata_usable_bytes += allocation_usable_size(ct_tree->tree, sizeof(*ct_tree->tree));
+    pthread_rwlock_rdlock(&ct_tree->rwlock);
+
+    for (int level = 1; level <= ct_tree->tree->level && level < BPLUS_MAX_LEVEL; level++) {
+        struct list_head *head = &ct_tree->tree->list[level];
+        struct list_head *pos, *next;
+        list_for_each_safe(pos, next, head) {
+            stats->tree_metadata_bytes += sizeof(struct bplus_non_leaf);
+            stats->tree_metadata_usable_bytes += allocation_usable_size(
+                list_entry(pos, struct bplus_node, link), sizeof(struct bplus_non_leaf));
+        }
+    }
+
+    struct list_head *head = &ct_tree->tree->list[0];
+    struct list_head *pos, *next;
+    list_for_each_safe(pos, next, head) {
+        struct compressed_leaf_ref *wrapper = list_entry(pos, struct compressed_leaf_ref, link);
+        if (wrapper->type != BPLUS_TREE_LEAF || wrapper->payload == 0) {
+            continue;
+        }
+        struct simple_leaf_node *leaf = (struct simple_leaf_node *)wrapper->payload;
+        stats->leaf_metadata_bytes += sizeof(*wrapper) +
+                                      sizeof(*leaf) - sizeof(leaf->active);
+        stats->active_allocated_bytes += sizeof(leaf->active);
+        stats->leaf_metadata_usable_bytes += allocation_usable_size(wrapper, sizeof(*wrapper)) +
+            allocation_usable_size(leaf, sizeof(*leaf)) - sizeof(leaf->active);
+
+        pthread_rwlock_rdlock(&leaf->rwlock);
+        stats->compressed_requested_bytes += leaf->compressed_capacity;
+        stats->compressed_usable_bytes += leaf->compressed_usable;
+        if (leaf->subpage_index && leaf->subpage_index != &leaf->inline_index) {
+            size_t bytes = (size_t)leaf->num_subpages * sizeof(struct subpage_index_entry);
+            stats->leaf_metadata_bytes += bytes;
+            stats->leaf_metadata_usable_bytes += allocation_usable_size(leaf->subpage_index, bytes);
+        }
+        if (leaf->pending) {
+            size_t bytes = sizeof(*leaf->pending) + leaf->pending->count * sizeof(struct kv_pair);
+            stats->pending_requested_bytes += bytes;
+            stats->pending_allocated_bytes +=
+                allocation_usable_size(leaf->pending, bytes);
+            if (pending_task_state_load(leaf->pending) == PENDING_TASK_FAILED)
+                stats->failed_pending_count++;
+        }
+
+        struct kv_pair *pairs = NULL;
+        size_t count = 0;
+        if (compressed_leaf_collect_pairs(ct_tree, leaf, &pairs, &count) != 0) {
+            free(pairs);
+            pthread_rwlock_unlock(&leaf->rwlock);
+            pthread_rwlock_unlock(&ct_tree->rwlock);
+            return -1;
+        }
+        stats->live_kv_bytes += count * sizeof(struct kv_pair);
+        stats->leaf_count++;
+        stats->fill_histogram[count < 128 ? count : 128]++;
+        for (size_t i = 0; visitor && i < count; i++) {
+            if (visitor(&pairs[i], context)) {
+                free(pairs);
+                pthread_rwlock_unlock(&leaf->rwlock);
+                pthread_rwlock_unlock(&ct_tree->rwlock);
+                return -1;
+            }
+        }
+        free(pairs);
+        pthread_rwlock_unlock(&leaf->rwlock);
+    }
+
+    pthread_rwlock_unlock(&ct_tree->rwlock);
+    return 0;
+}
+
+int bplus_tree_compressed_verify(struct bplus_tree_compressed *tree,
+                                 int (*visitor)(const struct kv_pair *, void *), void *context)
+{
+    struct bplus_tree_memory_stats stats = {0};
+    if (!visitor) return -1;
+    return compressed_memory_stats_collect(tree, &stats, visitor, context);
+}
+
+int bplus_tree_compressed_memory_stats(struct bplus_tree_compressed *ct_tree,
+                                       struct bplus_tree_memory_stats *stats)
+{
+    if (!ct_tree || !stats || !ct_tree->initialized) {
+        return -1;
+    }
+    memset(stats, 0, sizeof(*stats));
+    if (compressed_memory_stats_collect(ct_tree, stats, NULL, NULL) != 0) {
+        return -1;
+    }
+
+    if (ct_tree->owns_scheduler && ct_tree->scheduler) {
+        struct compaction_scheduler *scheduler = ct_tree->scheduler;
+        pthread_mutex_lock(&scheduler->lock);
+        stats->scheduler_and_qpl_bytes += sizeof(*scheduler);
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        stats->scheduler_and_qpl_bytes += scheduler->worker_stack_bytes;
+        stats->scheduler_and_qpl_usable_bytes += allocation_usable_size(scheduler->worker_stack, scheduler->worker_stack_bytes);
+#endif
+        if (scheduler->codec_slots) {
+            size_t bytes = (size_t)scheduler->batch_size * sizeof(*scheduler->codec_slots);
+            stats->scheduler_and_qpl_bytes += bytes;
+            stats->scheduler_and_qpl_usable_bytes += allocation_usable_size(scheduler->codec_slots, bytes);
+        }
+        stats->scheduler_and_qpl_bytes +=
+            (size_t)scheduler->queue_capacity * sizeof(*scheduler->queue);
+        stats->scheduler_and_qpl_bytes +=
+            (size_t)scheduler->batch_size *
+            (COMPRESSED_LEAF_SIZE + MAX_COMPRESSED_SIZE);
+        stats->scheduler_and_qpl_bytes += scheduler->qpl_job_bytes;
+        stats->scheduler_and_qpl_bytes +=
+            (size_t)scheduler->qpl_job_count *
+            (sizeof(*scheduler->qpl_jobs) + sizeof(*scheduler->qpl_job_buffers));
+        stats->scheduler_and_qpl_usable_bytes +=
+            allocation_usable_size(scheduler, sizeof(*scheduler)) +
+            allocation_usable_size(scheduler->queue, (size_t)scheduler->queue_capacity * sizeof(void *)) +
+            allocation_usable_size(scheduler->raw_workspaces, (size_t)scheduler->batch_size * COMPRESSED_LEAF_SIZE) +
+            allocation_usable_size(scheduler->compressed_workspaces, (size_t)scheduler->batch_size * MAX_COMPRESSED_SIZE) +
+            allocation_usable_size(scheduler->qpl_jobs, (size_t)scheduler->qpl_job_count * sizeof(void *)) +
+            allocation_usable_size(scheduler->qpl_job_buffers, (size_t)scheduler->qpl_job_count * sizeof(void *));
+        for (int i = 0; i < scheduler->qpl_job_count; i++)
+            stats->scheduler_and_qpl_usable_bytes += allocation_usable_size(scheduler->qpl_job_buffers[i],
+                scheduler->qpl_job_count ? scheduler->qpl_job_bytes / (size_t)scheduler->qpl_job_count : 0);
+        pthread_mutex_unlock(&scheduler->lock);
+    }
+    stats->process_qpl_tls_bytes =
+        __atomic_load_n(&qpl_tls_live_bytes, __ATOMIC_RELAXED);
+    stats->process_zlib_workspace_bytes = __atomic_load_n(&zlib_live_bytes, __ATOMIC_RELAXED);
+#ifdef HAVE_ZSTD
+    stats->process_zstd_workspace_bytes = __atomic_load_n(&zstd_live_bytes, __ATOMIC_RELAXED);
+#endif
+    return 0;
+}
+
+int bplus_tree_compressed_backend_info(struct bplus_tree_compressed *tree,
+                                      struct bplus_tree_backend_info *info)
+{
+    if (!tree || !info) return -1;
+    memset(info, 0, sizeof(*info));
+    info->requested = tree->requested_algo;
+    info->effective = tree->config.algo;
+    info->library_version = "builtin";
+    info->execution_path = "cpu";
+    info->explicit_fallbacks = __atomic_load_n(&tree->codec_fallbacks, __ATOMIC_RELAXED);
+    if (info->effective == COMPRESS_LZ4) info->library_version = LZ4_versionString();
+#ifdef HAVE_ZSTD
+    if (info->effective == COMPRESS_ZSTD_EXPERIMENT) info->library_version = ZSTD_versionString();
+#endif
+#ifdef HAVE_ZLIB
+    if (info->effective == COMPRESS_ZLIB_ACCEL) info->library_version = zlibVersion();
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    if (info->effective == COMPRESS_ZLIB_ACCEL && split_accel_counter)
+        info->execution_path = "zlib-accel-per-call-observed";
+#endif
+#endif
+#ifdef HAVE_QPL
+    if (info->effective == COMPRESS_QPL) {
+        info->library_version = qpl_get_library_version();
+        info->execution_path = tree->config.qpl_path == qpl_path_hardware ? "strict-hardware" :
+            tree->config.qpl_path == qpl_path_software ? "software" : "auto-actual-path-unobserved";
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+        if (tree->split_routes_enabled) info->execution_path = "split-explicit-routes";
+#endif
+    }
+#endif
+    if (tree->scheduler && tree->scheduler->contract_mode)
+        info->execution_path = "contract-test-real-software-codec";
+    if (compressed_tree_is_sharded(tree)) for (int i = 0; i < tree->shard_count; i++) {
+        struct bplus_tree_backend_info child;
+        bplus_tree_compressed_backend_info(tree->shards[i], &child);
+        info->explicit_fallbacks += child.explicit_fallbacks;
+    }
+    return 0;
+}
+
+int bplus_tree_compressed_scheduler_stats(struct bplus_tree_compressed *ct_tree,
+                                          struct bplus_tree_scheduler_stats *stats)
+{
+    if (!ct_tree || !stats || !ct_tree->initialized) {
+        return -1;
+    }
+    memset(stats, 0, sizeof(*stats));
+    struct compaction_scheduler *scheduler = ct_tree->scheduler;
+    if (!scheduler) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&scheduler->lock);
+    stats->queue_depth = (uint64_t)scheduler->queue_count;
+    stats->queue_peak = scheduler->queue_peak;
+    stats->batches = scheduler->batches;
+    stats->submitted_tasks = scheduler->submitted_tasks;
+    stats->completed_tasks = scheduler->completed_tasks;
+    stats->failed_tasks = scheduler->failed_tasks;
+    stats->retry_count = scheduler->retry_count;
+    stats->queue_full_fallbacks = scheduler->queue_full_fallbacks;
+    stats->synchronous_fallbacks = scheduler->synchronous_fallbacks;
+    stats->split_fallbacks = scheduler->split_fallbacks;
+    stats->total_queue_wait_ns = scheduler->total_queue_wait_ns;
+    stats->max_queue_wait_ns = scheduler->max_queue_wait_ns;
+    stats->submitted_jobs = scheduler->contract_stats.accepted;
+    stats->terminal_jobs = scheduler->contract_stats.terminal;
+    stats->failed_jobs = scheduler->contract_stats.failures;
+    stats->busy_jobs = scheduler->contract_stats.busy;
+    stats->outstanding_jobs = scheduler->contract_stats.in_flight;
+    stats->decompress_phase_ns = scheduler->decompress_phase_ns;
+    stats->merge_phase_ns = scheduler->merge_phase_ns;
+    stats->compress_phase_ns = scheduler->compress_phase_ns;
+    stats->commit_phase_ns = scheduler->commit_phase_ns;
+    stats->ready_at_wait_samples = scheduler->ready_at_wait_samples;
+    pthread_mutex_unlock(&scheduler->lock);
+    return 0;
+}
+
 int bplus_tree_compressed_calculate_stats(struct bplus_tree_compressed *ct_tree,
                                           size_t *total_size, size_t *compressed_size)
 {
@@ -4202,16 +6634,16 @@ int bplus_tree_compressed_calculate_stats(struct bplus_tree_compressed *ct_tree,
     struct list_head *pos, *n;
     int leaf_count = 0;
     list_for_each_safe(pos, n, head) {
-        struct bplus_leaf *leaf = list_entry(pos, struct bplus_leaf, link);
+        struct compressed_leaf_ref *leaf = list_entry(pos, struct compressed_leaf_ref, link);
         if (leaf->type != BPLUS_TREE_LEAF) {
             continue;
         }
-        if (leaf->data[0] == 0) {
+        if (leaf->payload == 0) {
             continue;
         }
 
         leaf_count++;
-        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->data[0];
+        struct simple_leaf_node *custom_leaf = (struct simple_leaf_node *)leaf->payload;
 
         pthread_rwlock_rdlock(&custom_leaf->rwlock);
 
@@ -4227,6 +6659,9 @@ int bplus_tree_compressed_calculate_stats(struct bplus_tree_compressed *ct_tree,
             p++;
         }
         landing_buffer_bytes += landing_pairs * sizeof(struct kv_pair);
+        if (custom_leaf->pending) {
+            landing_buffer_bytes += custom_leaf->pending->count * sizeof(struct kv_pair);
+        }
 
         // Add compressed data statistics
         if (custom_leaf->is_compressed) {
@@ -4287,9 +6722,36 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
 {
     struct compression_config effective_config = *config;
     apply_landing_buffer_env(&effective_config);
+#ifndef HAVE_QPL
+    if (effective_config.algo == COMPRESS_QPL) {
+        if (effective_config.qpl_path != qpl_path_auto) return NULL;
+        fprintf(stderr, "ZipCache: QPL unavailable; explicit initialization fallback to LZ4.\n");
+        effective_config.algo = COMPRESS_LZ4;
+    }
+#endif
+#ifndef HAVE_ZLIB
+    if (effective_config.algo == COMPRESS_ZLIB_ACCEL) return NULL;
+#endif
+#ifndef HAVE_ZSTD
+    if (effective_config.algo == COMPRESS_ZSTD_EXPERIMENT) return NULL;
+#endif
+#if ZIPCACHE_AGG_LAYOUT > 0
+    /* Experimental ordered framing owns its internal blocks; legacy hash
+     * subpages remain available in the independently built L0 target. */
+    if (effective_config.default_sub_pages != 1) return NULL;
+    if (env_int_clamped("BTREE_TEST_CONTRACT_MODE", 0, 0, 5)) {
+        fprintf(stderr, "ZipCache aggregation: legacy unframed contract adapter is unavailable for L1-L3.\n");
+        return NULL;
+    }
+#endif
 
     struct bplus_tree_compressed *ct_tree = calloc(1, sizeof(*ct_tree));
     if (ct_tree == NULL) return NULL;
+    ct_tree->requested_algo = config->algo;
+    ct_tree->codec_fallbacks = config->algo != effective_config.algo;
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    if (split_routes_init(ct_tree, config)) { free(ct_tree); return NULL; }
+#endif
 
     int shard_count = allow_sharding ? parse_shard_count() : 1;
     if (shard_count > 1) {
@@ -4303,6 +6765,9 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
         ct_tree->compression_enabled = 1;
         ct_tree->debug_mode = 0;
         ct_tree->config = effective_config;
+        const char *profile_env = getenv("BTREE_PROFILE_SUBMISSION");
+        ct_tree->submission_profile_enabled =
+            profile_env && strcmp(profile_env, "1") == 0;
 
         for (int i = 0; i < shard_count; i++) {
             ct_tree->shards[i] = bplus_tree_compressed_init_internal(order, entries, &effective_config, 0);
@@ -4321,6 +6786,7 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
     int fixed_entries = 1; // Each leaf in base tree just points to one custom leaf
     
     ct_tree->tree = bplus_tree_init(order, fixed_entries);
+    audit_add(ct_tree->tree, sizeof(*ct_tree->tree));
     if (ct_tree->tree == NULL) {
         free(ct_tree);
         return NULL;
@@ -4335,12 +6801,20 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
     ct_tree->compression_enabled = 1;
     ct_tree->debug_mode = 0;  // Debug off by default
     ct_tree->config = effective_config;
+    const char *profile_env = getenv("BTREE_PROFILE_SUBMISSION");
+    ct_tree->submission_profile_enabled =
+        profile_env && strcmp(profile_env, "1") == 0;
     configure_background_compaction(ct_tree);
 
     if (ct_tree->config.algo == COMPRESS_QPL) {
         if (init_qpl(ct_tree) != 0) {
             fprintf(stderr, "Warning: QPL initialization failed, QPL layouts will not be available\n");
-            if (ct_tree->config.qpl_path == qpl_path_hardware) {
+            if (ct_tree->config.qpl_path != qpl_path_auto
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+                || ct_tree->split_routes_enabled
+#endif
+            ) {
+                audit_forget(ct_tree->tree);
                 bplus_tree_deinit(ct_tree->tree);
                 pthread_rwlock_destroy(&ct_tree->rwlock);
                 pthread_mutex_destroy(&ct_tree->bg_scan_lock);
@@ -4354,15 +6828,32 @@ static struct bplus_tree_compressed *bplus_tree_compressed_init_internal(int ord
         }
     }
 
-    start_background_compaction(ct_tree);
-
     return ct_tree;
 }
 
 struct bplus_tree_compressed *bplus_tree_compressed_init_with_config(int order, int entries,
                                                                    struct compression_config *config)
 {
-    return bplus_tree_compressed_init_internal(order, entries, config, 1);
+    int background_requested = env_bool_enabled("BTREE_BG_COMPACTION", 0);
+    struct bplus_tree_compressed *tree =
+        bplus_tree_compressed_init_internal(order, entries, config, 1);
+    if (!tree) {
+        return NULL;
+    }
+    struct compaction_scheduler *scheduler = compaction_scheduler_create(tree);
+    if (background_requested && !scheduler &&
+        (env_int_clamped("BTREE_TEST_CONTRACT_MODE", 0, 0, 5) ||
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+         tree->split_routes_enabled || env_int_clamped("BTREE_TEST_SPLIT_CODEC_MODE", 0, 0, 5) ||
+#endif
+         (tree->config.algo == COMPRESS_QPL && tree->config.qpl_path == qpl_path_hardware))) {
+        /* A strict hardware request must never degrade to synchronous or
+         * software execution because the batcher's jobs could not start. */
+        bplus_tree_compressed_deinit(tree);
+        return NULL;
+    }
+    compaction_scheduler_attach(tree, scheduler, scheduler != NULL);
+    return tree;
 }
 
 void bplus_tree_compressed_set_debug(struct bplus_tree_compressed *ct_tree, int enable)
@@ -4382,15 +6873,51 @@ void bplus_tree_compressed_set_debug(struct bplus_tree_compressed *ct_tree, int 
 
 int init_qpl(struct bplus_tree_compressed *ct_tree)
 {
-    if (ct_tree->qpl_pool_size > 0) {
+    if (ct_tree->qpl_initialized) {
         return 0; // Already initialized
     }
+#ifdef ZIPCACHE_AGG_EXPERIMENT
+    if (ct_tree->split_routes_enabled) {
+        if (!qpl_tls_job_cache_enabled()) return -1;
+        for (int i = 0; i < 3; i++) {
+            uint32_t bytes = 0;
+            if (qpl_get_job_size(ct_tree->split_routes[i], &bytes) != QPL_STS_OK || !bytes) return -1;
+            qpl_job *job = malloc(bytes);
+            if (!job) return -1;
+            qpl_status rc = qpl_init_job(ct_tree->split_routes[i], job);
+            if (rc == QPL_STS_OK) qpl_fini_job(job);
+            free(job);
+            if (rc != QPL_STS_OK) return -1;
+        }
+        ct_tree->qpl_initialized = 1;
+        return 0;
+    }
+#endif
 
     uint32_t job_size = 0;
     qpl_path_t qpl_path = ct_tree->config.qpl_path;
     qpl_status status = qpl_get_job_size(qpl_path, &job_size);
     if (status != QPL_STS_OK || job_size == 0) {
         return -1;
+    }
+
+    /* TLS is the default foreground backend; do not also reserve a pool per shard. */
+    if (qpl_tls_job_cache_enabled()) {
+        uint8_t *validation_buffer = malloc(job_size);
+        if (!validation_buffer) {
+            return -1;
+        }
+        qpl_job *validation_job = (qpl_job *)validation_buffer;
+        status = qpl_init_job(qpl_path, validation_job);
+        if (status == QPL_STS_OK) {
+            qpl_fini_job(validation_job);
+        }
+        free(validation_buffer);
+        if (status != QPL_STS_OK) {
+            return -1;
+        }
+        ct_tree->qpl_initialized = 1;
+        return 0;
     }
 
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
@@ -4453,6 +6980,9 @@ int init_qpl(struct bplus_tree_compressed *ct_tree)
     ct_tree->qpl_job_free_list = free_list;
     ct_tree->qpl_pool_size = pool_size;
     ct_tree->qpl_free_count = pool_size;
+    ct_tree->qpl_initialized = 1;
+    ct_tree->qpl_pool_bytes =
+        (size_t)pool_size * (job_size + sizeof(*jobs) + sizeof(*buffers) + sizeof(*free_list));
     return 0;
 
 fail:
@@ -4481,6 +7011,7 @@ void cleanup_qpl(struct bplus_tree_compressed *ct_tree)
     if (ct_tree == NULL) {
         return;
     }
+    ct_tree->qpl_initialized = 0;
     if (ct_tree->qpl_pool_size <= 0 &&
         !ct_tree->qpl_job_pool &&
         !ct_tree->qpl_job_buffers &&
@@ -4512,6 +7043,7 @@ void cleanup_qpl(struct bplus_tree_compressed *ct_tree)
     ct_tree->qpl_job_pool = NULL;
     ct_tree->qpl_job_buffers = NULL;
     ct_tree->qpl_job_free_list = NULL;
+    ct_tree->qpl_pool_bytes = 0;
 
     pthread_cond_destroy(&ct_tree->qpl_pool_cond);
     pthread_mutex_destroy(&ct_tree->qpl_pool_lock);

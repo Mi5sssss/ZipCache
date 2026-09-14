@@ -47,6 +47,10 @@ DRAM-tier/tests/btree/results/iaa_eval/
 
 # Local/internal planning notes
 DRAM-tier/tests/btree/CONCURRENCY_SCALING_PLAN.md
+
+# Private collaborator-provided correspondence and unpublished results
+/private/
+/zipCacheMicroBenchmarks_v1.xlsx
 DRAM-tier/tests/btree/AGENT*.md
 DRAM-tier/tests/btree/*_AGENT*.md
 
@@ -61,3 +65,11 @@ SilesiaCorpus/.git/
 # Compression test files
 *.compressed
 *.decompressed
+
+# Local Intel evaluation outputs and dependency builds
+/intel-runs/
+/qpl-source/
+/qpl-build/
+/qpl-install/
+DRAM-tier/tests/btree_iaa/work/
+__pycache__/

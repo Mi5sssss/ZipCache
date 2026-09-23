@@ -3,6 +3,67 @@
 Branch: `wip/iaa-hybrid-evaluation`. This is an experimental evaluation branch,
 not a production release or a claim of verified IAA acceleration.
 
+## Focused follow-up: text-only results
+
+The diagnostic update does not change the B+Tree or scheduler implementation.
+It adds a focused matrix, explicit static QPL linkage, and `summary.txt` for
+email when file-sharing services are restricted. Hardware validation remains
+pending; the runner never interprets software queue depth as device occupancy.
+
+For an existing checkout, preserve any local linking changes before updating:
+
+```sh
+git status --short
+git switch wip/iaa-hybrid-evaluation
+git pull --ff-only origin wip/iaa-hybrid-evaluation
+git submodule update --init SilesiaCorpus
+```
+
+If Git reports overlapping local changes, do not discard them. Use a separate
+fresh clone with the command below, or send the local patch for review.
+
+After verifying CPU IDs and NUMA placement as described below, run:
+
+```sh
+python3 DRAM-tier/tests/btree_iaa/intel_eval.py \
+  --out intel-runs/diagnostic-smoke --profile smoke --diagnostic \
+  --qpl-root /opt/qpl-1.9.0 --qpl-linkage static \
+  --cpu-list 2,4 --numa-node 0
+
+# Only proceed if smoke succeeds.
+python3 DRAM-tier/tests/btree_iaa/intel_eval.py \
+  --out intel-runs/diagnostic-screen --profile screen --diagnostic \
+  --qpl-root /opt/qpl-1.9.0 --qpl-linkage static \
+  --cpu-list 2,4 --numa-node 0 --clients 1 4 --reads 80
+```
+
+Replace the QPL prefix, CPU IDs and NUMA node with the actual host values.
+`--qpl-linkage static` selects `lib[64]/libqpl.a`; use `shared` for
+`lib[64]/libqpl.so`. This is static QPL linkage, not a fully static executable.
+The exact archive/shared-library checksum is recorded. Required QPL hardware
+tests and cross-decoding still run; static linkage does not bypass them.
+
+The focused matrix retains RAW for a memory reference, LZ4, QPL software and
+strict IAA on the same 80/20 trace, plus a separate byte-identical pure-GET
+software/hardware comparison. It does not run the hybrid B/C policy sweep.
+Both mappings and 1/4 clients remain separate results. Queue-admission
+backpressure remains OFF, matching the prior default. Only if synchronous
+fallbacks are significant, repeat the screen into a new output directory with
+`--backpressure 1`; compare CPU, both tails, drain and throughput together.
+
+Please email or paste `intel-runs/diagnostic-screen/summary.txt`. It includes
+performance, active/pending/base hits, synchronous fallbacks, lock-held codec
+calls, maintenance work, QPL routes/errors, drain, and tracked memory ratios.
+On failure, send the failing run's `summary.txt` and the named log's error
+excerpt. Keep the complete archive locally; uploading it is optional.
+
+Local validation of this update: macOS CPU-only smoke completed with both
+mappings and 1/4 clients. CTest reported 71 executed tests passing and seven
+QPL-only tests skipped (78 registered). Text-summary failure handling and
+static-link command planning have offline tests. Actual Linux static QPL
+linking and IAA execution are not verified on this Mac and remain required
+checks on the target host.
+
 ## Goal
 
 Determine whether the revised small-KV B+Tree supplies useful work to IAA and
@@ -37,7 +98,8 @@ not a production AI/agent workload.
 - `taskset`, `numactl`, and `ldd`.
 - Real QPL **v1.9.0**, source commit
   `1813ccedb90b6468d47cc4ea87ae8b754a9151e1`, installed in a private prefix
-  containing `include/qpl/qpl.h` and `lib/libqpl.so` or `lib64/libqpl.so`.
+  containing `include/qpl/qpl.h` and `lib[64]/libqpl.so` (shared) or
+  `lib[64]/libqpl.a` (with `--qpl-linkage static`).
 - An already configured, accessible IAA work queue. The scripts do not use sudo,
   install packages, configure work queues, or change system settings.
 
@@ -148,8 +210,9 @@ Output directories must be new; previous results are never overwritten.
 
 ## 5. Return the results
 
-Send the generated `intel-results.tar.gz` from each output directory, including
-failed smoke runs. For the required commands these are:
+Email or paste `summary.txt` from each output directory, including failed
+smoke runs. No Google Drive upload is required. Keep the generated archives
+locally for any follow-up investigation; they are optional to send:
 
 ```text
 intel-runs/smoke/intel-results.tar.gz

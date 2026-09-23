@@ -21,6 +21,7 @@ def main():
     p.add_argument("--cpu-list");p.add_argument("--numa-node",type=int)
     p.add_argument("--accel-library",type=Path)
     p.add_argument("--timeout",type=int,default=3600)
+    p.add_argument("--backpressure",type=int,choices=(0,1),default=0)
     p.add_argument("--policies",nargs="+",choices=["E-raw","E-lz4","E-zstd","E-zlib",*POLICIES])
     p.add_argument("--dry-run",action="store_true")
     a=p.parse_args();m=json.loads((a.trace/"manifest.json").read_text())
@@ -45,7 +46,8 @@ def main():
             dest=a.out/f"rep-{rep+1}-l{layout}-{name}"
             cmd=[sys.executable,str(Path(__file__).with_name("run.py")),str(a.trace.resolve()),str(dest.resolve()),
                  "--build",str(a.build.resolve()),"--layouts",str(layout),"--codecs",codec,"--performance",
-                 "--arrival-rate",str(a.arrival_rate),"--timeout",str(a.timeout)]
+                 "--arrival-rate",str(a.arrival_rate),"--timeout",str(a.timeout),
+                 "--backpressure",str(a.backpressure)]
             if routes:cmd += ["--routes",*routes]
             if a.cpu_list:cmd += ["--cpu-list",a.cpu_list]
             if a.numa_node is not None:cmd += ["--numa-node",str(a.numa_node)]

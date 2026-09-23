@@ -52,6 +52,18 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn("AGG_BASE_IMAGE", env)
             self.assertEqual(env["BTREE_QPL_CROSS_HARDWARE"], "1")
 
+    def test_focused_diagnostic_and_static_link_plan(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.options(Path(d), "--diagnostic", "--qpl-linkage", "static", "--backpressure", "1")
+            plan = runner.build_plan(a)
+            self.assertTrue(any("libqpl.a" in x for x in plan['steps'][0]['command']))
+            for step in plan['steps']:
+                if step.get('group'):
+                    self.assertEqual(step['policies'], ['E-raw', 'E-lz4', 'A', 'D'])
+                    at = step['command'].index('--backpressure')
+                    self.assertEqual(step['command'][at+1], '1')
+            self.assertTrue(any(s.get('attribution') for s in plan['steps']))
+
     def test_qualification_and_validation(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -125,6 +137,22 @@ class RunnerTests(unittest.TestCase):
             runner.summarize(a, plan); runner.archive_results(a)
             self.assertTrue((a.out / "intel-results.tar.gz").is_file())
             self.assertEqual(json.loads((a.out / "summary.json").read_text())["product_gate"], "pending")
+            report = (a.out / 'summary.txt').read_text()
+            self.assertIn('Status: failed', report)
+            self.assertIn('No completed performance measurements', report)
+            self.assertIn('Incomplete matrix JSON', report)
+
+    def test_text_summary_preserves_diagnostics_and_unknowns(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = self.options(Path(d)); a.out.mkdir()
+            rows = [dict(experiment='fixture', policy='D', layout=3, rep=1, mode='performance', status='ok',
+                product=dict(sync_fallbacks=7, write_lock_codec_calls=9), aggregation={}, execution={})]
+            runner.write_summary(a, dict(status='fixture-only', steps=[]), rows, [])
+            text = (a.out / 'summary.txt').read_text()
+            self.assertIn('"sync_fallbacks": 7', text)
+            self.assertIn('"write_lock_codec_calls": 9', text)
+            self.assertIn('"pending_wait_ns": "unavailable"', text)
+            self.assertIn('NOT IAA WQ occupancy', text)
 
     def test_real_tree_shared_shard_trace(self):
         # CTest supplies a real L3 binary; this is not a queue/cache substitute.

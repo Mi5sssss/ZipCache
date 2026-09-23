@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from intel_summary import write_summary
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -33,6 +34,10 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--qpl-root", type=Path)
+    p.add_argument("--qpl-linkage", choices=("shared", "static"), default="shared")
+    p.add_argument("--diagnostic", action="store_true", help="RAW/LZ4/QPL software/IAA plus same-byte GET; no hybrid policy sweep")
+    p.add_argument("--backpressure", type=int, choices=(0, 1), default=0,
+                   help="Explicit queue-admission control, unchanged default 0")
     p.add_argument("--cpu-list", help="Exactly 2 or 8 explicit logical CPU IDs")
     p.add_argument("--numa-node", type=int)
     p.add_argument("--profile", choices=("smoke", "screen", "qualification"), default="screen")
@@ -58,6 +63,8 @@ def validate(a):
         raise ValueError("Output already exists; choose a fresh directory")
     if a.cpu_only and a.profile != "smoke":
         raise ValueError("--cpu-only is restricted to smoke, not a qualification substitute")
+    if a.diagnostic and a.profile == "qualification":
+        raise ValueError("--diagnostic is a focused screen, not qualification")
     if not a.cpu_only:
         ids = (a.cpu_list or "").split(",")
         if len(ids) not in (2, 8) or not all(x.isdigit() for x in ids) or len(set(map(int, ids))) != len(ids):
@@ -106,7 +113,7 @@ def build_plan(a):
         configure += ["-DAGG_DISABLE_QPL=ON"]
     else:
         configure += ["-DAGG_DISABLE_QPL=OFF", f"-DQPL_INCLUDE_DIR={a.qpl_root / 'include'}",
-                      f"-DQPL_LIBRARY={a.qpl_root / 'lib/libqpl.so'}"]
+                      f"-DQPL_LIBRARY={a.qpl_root / ('lib/libqpl.a' if a.qpl_linkage == 'static' else 'lib/libqpl.so')}"]
     add("configure", configure)
     add("build", ["cmake", "--build", build, "-j4"])
     add("correctness", ["ctest", "--test-dir", build, "--output-on-failure", "--no-tests=error"],
@@ -130,13 +137,13 @@ def build_plan(a):
                         dest = a.out / "matrices" / f"{group}-s{seed}-rate{rate}"
                         cmd = [sys.executable, HERE / "split_matrix.py", trace, dest, "--build", build,
                                "--layouts", *a.layouts, "--repetitions", repetitions, "--arrival-rate", rate,
-                               "--timeout", a.timeout]
-                        if a.cpu_only:
-                            cmd += ["--policies", *CPU_POLICIES]
-                        else:
+                               "--timeout", a.timeout, "--backpressure", a.backpressure]
+                        policies = CPU_POLICIES if a.cpu_only else (["E-raw", "E-lz4", "A", "D"] if a.diagnostic else POLICIES)
+                        cmd += ["--policies", *policies]
+                        if not a.cpu_only:
                             cmd += ["--cpu-list", a.cpu_list, "--numa-node", a.numa_node]
                         add(dest.name, cmd, matrix=str(dest), group=group, rate=rate,
-                            policies=CPU_POLICIES if a.cpu_only else POLICIES, seed=seed,
+                            policies=policies, seed=seed,
                             timeout=a.timeout * 2 * len(a.layouts) * repetitions * len(POLICIES) + 120)
                         matrices.append(steps[-1])
     # Same-byte GET is attribution only. It does not change the mixed-write data
@@ -183,9 +190,12 @@ def require_corpus():
 def execute(step, a, env):
     command = list(step["command"])
     if step["name"] == "configure" and not a.cpu_only:
-        library = next((p for p in (a.qpl_root / "lib/libqpl.so", a.qpl_root / "lib64/libqpl.so") if p.is_file()), None)
+        filename = "libqpl.a" if a.qpl_linkage == "static" else "libqpl.so"
+        library = next((a.qpl_root / d / filename for d in ("lib", "lib64") if (a.qpl_root / d / filename).is_file()), None)
         if library is None or not (a.qpl_root / "include/qpl/qpl.h").is_file():
-            raise ValueError("QPL prefix must contain include/qpl/qpl.h and lib[64]/libqpl.so")
+            raise ValueError(f"QPL prefix must contain include/qpl/qpl.h and lib[64]/{filename}")
+        a.qpl_library = dict(path=str(library), linkage=a.qpl_linkage,
+                             sha256=hashlib.sha256(library.read_bytes()).hexdigest())
         command = [f"-DQPL_LIBRARY={library}" if x.startswith("-DQPL_LIBRARY=") else x for x in command]
     if step.get("bound"):
         command = ["numactl", f"--membind={a.numa_node}", "taskset", "-c", a.cpu_list] + command
@@ -215,7 +225,9 @@ def execute(step, a, env):
         raise RuntimeError("A required hardware test was skipped; this is not a successful hardware run")
     if step.get("check_qpl"):
         lines = [line for line in path.read_text().splitlines() if "libqpl.so" in line]
-        if len(lines) != 1 or str(a.qpl_root) + "/" not in lines[0]:
+        if a.qpl_linkage == "static" and lines:
+            raise RuntimeError("Static QPL requested but executable also loads shared QPL")
+        if a.qpl_linkage == "shared" and (len(lines) != 1 or str(a.qpl_root) + "/" not in lines[0]):
             raise RuntimeError("ldd did not resolve QPL from the explicitly supplied prefix")
     if step.get("matrix"):
         check_matrix(step, a)
@@ -257,7 +269,10 @@ def compare_groups(a, plan, env):
     for (group, rate), directories in groups.items():
         for layout in a.layouts:
             for candidate, reference in [("B", "A"), ("B", "D"), ("C", "B"), ("D", "C")]+[
-                    (candidate, reference) for candidate in ("B", "D") for reference in CPU_POLICIES[1:]]:
+                    (candidate, reference) for candidate in ("B", "D") for reference in CPU_POLICIES[1:]] + [("D", "A")]:
+                available = next(s["policies"] for s in plan["steps"] if s.get("group") == group and s.get("rate") == rate)
+                if candidate not in available or reference not in available:
+                    continue
                 name = f"{group}-rate{rate}-L{layout}-{candidate}-vs-{reference}"
                 step = dict(name="compare-"+name, command=[sys.executable, str(HERE / "split_compare.py"),
                     str(a.out / "comparisons" / (name+".json")), *directories, "--candidate", candidate,
@@ -362,6 +377,7 @@ def summarize(a, plan):
     for r in flat:
         lines.append(f"| {r['experiment']} / L{r['layout']} {r['policy']} rep {r['repetition']} | {r['qps']:.0f} | {r['cpu_ns_per_op']:.1f} | {r['get_p99_us']:.3f} | {r['put_p99_us']:.3f} |")
     (a.out / "SUMMARY.md").write_text("\n".join(lines) + "\n")
+    write_summary(a, plan, rows, flat)
 
 
 def archive_results(a):
@@ -389,7 +405,11 @@ def main():
     if a.dry_run:
         print(json.dumps(plan, indent=2)); return
     a.out.mkdir(parents=True); (a.out / "logs").mkdir()
-    plan.update(status="running", started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True)
+    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, text=True, capture_output=True)
+    plan.update(status="running", started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                source_commit=revision.stdout.strip() or "unavailable", tracked_changes=dirty.stdout.strip(),
+                invocation=sys.argv)
     save(a.out / "run.json", plan)
     env = child_environment(a)
     try:
@@ -413,7 +433,7 @@ def main():
         save(a.out / "run.json", plan)
         summarize(a, plan)
         archive_results(a)
-    print(f"Report: {a.out / 'SUMMARY.md'}\nReturn: {a.out / 'intel-results.tar.gz'}")
+    print(f"Email or paste: {a.out / 'summary.txt'}\nOptional archive: {a.out / 'intel-results.tar.gz'}")
     if plan["status"] == "failed":
         raise SystemExit(1)
 

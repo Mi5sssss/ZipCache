@@ -7,7 +7,7 @@ not a production release or a claim of verified IAA acceleration.
 
 The diagnostic update does not change the B+Tree or scheduler implementation.
 It adds a focused matrix, explicit static QPL linkage, and `summary.txt` for
-email when file-sharing services are restricted. Hardware validation remains
+text-only sharing. Hardware validation remains
 pending; the runner never interprets software queue depth as device occupancy.
 
 For an existing checkout, preserve any local linking changes before updating:
@@ -211,7 +211,7 @@ Output directories must be new; previous results are never overwritten.
 ## 5. Return the results
 
 Email or paste `summary.txt` from each output directory, including failed
-smoke runs. No Google Drive upload is required. Keep the generated archives
+smoke runs. No external file-sharing service is required. Keep the generated archives
 locally for any follow-up investigation; they are optional to send:
 
 ```text

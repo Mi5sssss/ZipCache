@@ -49,6 +49,8 @@ DRAM-tier/tests/btree/results/iaa_eval/
 DRAM-tier/tests/btree/CONCURRENCY_SCALING_PLAN.md
 
 # Private collaborator-provided correspondence and unpublished results
+/INTEL_DIAGNOSTIC_EMAIL.md
+/.agents/workflows/project-status.md
 /private/
 /zipCacheMicroBenchmarks_v1.xlsx
 DRAM-tier/tests/btree/AGENT*.md

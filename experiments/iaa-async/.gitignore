@@ -1,0 +1,7 @@
+/work/
+/results*/
+/local-*/
+__pycache__/
+# Required source files otherwise matched by repository-wide ignore patterns.
+!/DRAM-tier/tests/btree/test_compression_concurrency.c
+!/DRAM-tier/tests/btree_iaa/accel-observer.cmake

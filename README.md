@@ -1,5 +1,19 @@
 # ZipCache DRAM-tier B+Tree
 
+## WIP hardware evaluation: start here
+
+On `wip/iaa-hybrid-evaluate`, the new self-contained experiment is in
+[`experiments/iaa-async`](experiments/iaa-async/README_ASYNC_QPL.md).
+Follow [IAA_ASYNC_EVALUATION.md](IAA_ASYNC_EVALUATION.md) for the exact commands,
+comparison matrix, local verification and remaining hardware checks.
+
+This branch adds the experiment without replacing the existing library or older
+evaluation scripts. The new experiment uses bounded cross-leaf QPL asynchronous
+submission; frontend GET is unchanged. Despite the branch name, this revision
+does **not** evaluate hardware-compression / CPU-decompression hybrid routing.
+Actual QPL execution and product performance remain unverified on hardware.
+The rest of this README describes the older baseline, not the new experiment.
+
 This repository contains the ZipCache DRAM-tier compressed B+Tree prototype. The current focus is the in-memory cache tier: compact B+Tree leaf pages, reduce foreground compression stalls, and evaluate CPU and hardware-assisted compression paths on realistic key-value cache workloads.
 
 Detailed benchmark commands and result tables are kept separately in [DRAM-tier/tests/btree/IAA_EVALUATION.md](DRAM-tier/tests/btree/IAA_EVALUATION.md).

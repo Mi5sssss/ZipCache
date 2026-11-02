@@ -1,0 +1,7 @@
+build*/
+results*/
+traces/
+__pycache__/
+*.pyc
+*.perf.data
+*.perf.data.old

@@ -1,0 +1,6 @@
+{
+  "qpl": {"url":"https://github.com/intel/qpl.git", "tag":"v1.9.0", "commit":"1813ccedb90b6468d47cc4ea87ae8b754a9151e1"},
+  "zlib_accel": {"url":"https://github.com/intel/zlib-accel.git", "commit":"b437553304ca765be38c7352d5a3086efd40cd09", "USE_IAA":"ON", "USE_QAT":"OFF", "USE_IGZIP":"OFF", "ENABLE_STATISTICS":"ON", "status":"compatibility comparator pending, not verified IAA execution"},
+  "mac_observed": {"lz4":"1.9.4", "zstd":"1.5.5", "zlib_header":"1.2.11", "zlib_runtime":"1.2.12", "compiler":"AppleClang 14.0.3.14030022"},
+  "policy":"Record actual runtime version, binary digest and loaded library. Missing QPL is unavailable, never a compatibility-layer pass. CPU library versions must match within a comparison."
+}

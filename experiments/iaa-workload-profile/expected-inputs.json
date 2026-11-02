@@ -1,0 +1,170 @@
+{
+  "uniform-r80-n10000": {
+    "schema": 1,
+    "source": "real Silesia samba, complete 128B slices",
+    "archive_sha256": "285c06096c0e24b71e28705f489932482b23d823b306dddc1cd8d0a8145121a1",
+    "samba_sha256": "93ba07bc44d8267789c1d911992f40b089ffa2140b4a160fac11ccae9a40e7b2",
+    "samba_bytes": 21606400,
+    "keys": 150000,
+    "operations": 10000,
+    "clients": 4,
+    "seed": 11,
+    "zipf_alpha": 0,
+    "read_pct": 80,
+    "rank_mapping": "clustered",
+    "payload_mapping": "adjacent",
+    "trace_sha256": "e770a5b8054b05a96ec45f0e17246608dbe5c6414d417d3a0f7b6748de895efc",
+    "rank_map_sha256": "bfc6c9531ff703606a876b4a00c61c3133bccd9c7d41bd28b81e662d83d99d75",
+    "client_events": [
+      2490,
+      2518,
+      2490,
+      2502
+    ],
+    "worker_hashes": [
+      "73221a6f34f6eab8",
+      "654debc967ef1fd1",
+      "e370144daa40254d",
+      "77f559449f9613f8"
+    ],
+    "puts": 1876,
+    "updates_per_key": 0.012506666666666666,
+    "top_1pct_request_share": 0.0091,
+    "top_10pct_request_share": 0.0961,
+    "assumptions": [
+      "Synthetic finite Zipf arrival pattern, not a production trace",
+      "Single client owns each key for an exact latest-value oracle",
+      "Client load imbalance is reported, no padding counted as operations",
+      "Clustered/dispersed refers to popularity rank mapping, independent of payload mapping",
+      "Updates select another existing 128B samba slice, never mutate or pad the bytes",
+      "Fixed prefix read warmup, no future hot-set oracle"
+    ],
+    "update_rule": "slice=(payload_map[key-1]+version*7919)%samba_chunks; version=local_event_index*clients+client+1"
+  },
+  "uniform-r80-n1000000": {
+    "schema": 1,
+    "source": "real Silesia samba, complete 128B slices",
+    "archive_sha256": "285c06096c0e24b71e28705f489932482b23d823b306dddc1cd8d0a8145121a1",
+    "samba_sha256": "93ba07bc44d8267789c1d911992f40b089ffa2140b4a160fac11ccae9a40e7b2",
+    "samba_bytes": 21606400,
+    "keys": 150000,
+    "operations": 1000000,
+    "clients": 4,
+    "seed": 11,
+    "zipf_alpha": 0,
+    "read_pct": 80,
+    "rank_mapping": "clustered",
+    "payload_mapping": "adjacent",
+    "trace_sha256": "b052b01aabde5f64842be48af59d79b780c2332133819a11787bcf974e60d8cb",
+    "rank_map_sha256": "bfc6c9531ff703606a876b4a00c61c3133bccd9c7d41bd28b81e662d83d99d75",
+    "client_events": [
+      249581,
+      249847,
+      250533,
+      250039
+    ],
+    "worker_hashes": [
+      "5695f0c5f7b9ec06",
+      "c1794b7b764be0e4",
+      "689c938703e3275f",
+      "5528d37d931500dc"
+    ],
+    "puts": 199999,
+    "updates_per_key": 1.3333266666666668,
+    "top_1pct_request_share": 0.00998,
+    "top_10pct_request_share": 0.099704,
+    "assumptions": [
+      "Synthetic finite Zipf arrival pattern, not a production trace",
+      "Single client owns each key for an exact latest-value oracle",
+      "Client load imbalance is reported, no padding counted as operations",
+      "Clustered/dispersed refers to popularity rank mapping, independent of payload mapping",
+      "Updates select another existing 128B samba slice, never mutate or pad the bytes",
+      "Fixed prefix read warmup, no future hot-set oracle"
+    ],
+    "update_rule": "slice=(payload_map[key-1]+version*7919)%samba_chunks; version=local_event_index*clients+client+1"
+  },
+  "clustered-r20-n1000000": {
+    "schema": 1,
+    "source": "real Silesia samba, complete 128B slices",
+    "archive_sha256": "285c06096c0e24b71e28705f489932482b23d823b306dddc1cd8d0a8145121a1",
+    "samba_sha256": "93ba07bc44d8267789c1d911992f40b089ffa2140b4a160fac11ccae9a40e7b2",
+    "samba_bytes": 21606400,
+    "keys": 150000,
+    "operations": 1000000,
+    "clients": 4,
+    "seed": 11,
+    "zipf_alpha": 1.1,
+    "read_pct": 20,
+    "rank_mapping": "clustered",
+    "payload_mapping": "adjacent",
+    "trace_sha256": "85435e1bf4da0d47ba70d824ba6a4a2e6640c31cc0ef84796fba266e639cbdf2",
+    "rank_map_sha256": "bfc6c9531ff703606a876b4a00c61c3133bccd9c7d41bd28b81e662d83d99d75",
+    "client_events": [
+      224445,
+      259874,
+      199540,
+      316141
+    ],
+    "worker_hashes": [
+      "e51e6195450f7fa6",
+      "d222fc5c14b7d513",
+      "303f61a119fb8369",
+      "ff23e19c706f3945"
+    ],
+    "puts": 799777,
+    "updates_per_key": 5.331846666666666,
+    "top_1pct_request_share": 0.764608,
+    "top_10pct_request_share": 0.895476,
+    "assumptions": [
+      "Synthetic finite Zipf arrival pattern, not a production trace",
+      "Single client owns each key for an exact latest-value oracle",
+      "Client load imbalance is reported, no padding counted as operations",
+      "Clustered/dispersed refers to popularity rank mapping, independent of payload mapping",
+      "Updates select another existing 128B samba slice, never mutate or pad the bytes",
+      "Fixed prefix read warmup, no future hot-set oracle"
+    ],
+    "update_rule": "slice=(payload_map[key-1]+version*7919)%samba_chunks; version=local_event_index*clients+client+1"
+  },
+  "uniform-r95-n1000000": {
+    "schema": 1,
+    "source": "real Silesia samba, complete 128B slices",
+    "archive_sha256": "285c06096c0e24b71e28705f489932482b23d823b306dddc1cd8d0a8145121a1",
+    "samba_sha256": "93ba07bc44d8267789c1d911992f40b089ffa2140b4a160fac11ccae9a40e7b2",
+    "samba_bytes": 21606400,
+    "keys": 150000,
+    "operations": 1000000,
+    "clients": 4,
+    "seed": 11,
+    "zipf_alpha": 0,
+    "read_pct": 95,
+    "rank_mapping": "clustered",
+    "payload_mapping": "adjacent",
+    "trace_sha256": "f540398d51517efacbb71c1fa46b8ef2e967e31222865e7dc6da8ae8d8dfb4fd",
+    "rank_map_sha256": "bfc6c9531ff703606a876b4a00c61c3133bccd9c7d41bd28b81e662d83d99d75",
+    "client_events": [
+      249581,
+      249847,
+      250533,
+      250039
+    ],
+    "worker_hashes": [
+      "e74554cddf640e98",
+      "d6d8a5fb0f2a0259",
+      "27d3728d17ccb1b2",
+      "7508ae90e5dd199f"
+    ],
+    "puts": 49794,
+    "updates_per_key": 0.33196,
+    "top_1pct_request_share": 0.00998,
+    "top_10pct_request_share": 0.099704,
+    "assumptions": [
+      "Synthetic finite Zipf arrival pattern, not a production trace",
+      "Single client owns each key for an exact latest-value oracle",
+      "Client load imbalance is reported, no padding counted as operations",
+      "Clustered/dispersed refers to popularity rank mapping, independent of payload mapping",
+      "Updates select another existing 128B samba slice, never mutate or pad the bytes",
+      "Fixed prefix read warmup, no future hot-set oracle"
+    ],
+    "update_rule": "slice=(payload_map[key-1]+version*7919)%samba_chunks; version=local_event_index*clients+client+1"
+  }
+}

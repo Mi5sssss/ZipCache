@@ -1,0 +1,1 @@
+Minimal original measured Mac LZ4/RAW/zlib rows used only by report-validation tests. These fixtures are not hardware results or a new performance comparison. Full historical logs and private collaboration records are excluded.

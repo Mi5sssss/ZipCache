@@ -1,0 +1,1186 @@
+[
+  {
+    "CPU_PROFILE": {
+      "version": 1,
+      "mode": "threads",
+      "epoch": "preload-drained through final-drain, OS snapshots bracket API timing",
+      "process_cpu_ns": 2897119000,
+      "instrumentation_static_bytes": 21120,
+      "threads": [
+        {
+          "role": "main_idle",
+          "valid": true,
+          "cpu_ns": 0,
+          "stages": {
+            "get_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "put_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "encode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "decode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "submit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "poll": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "wait_backoff": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "qpl_execute_inclusive": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "background_step_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "merge": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "commit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "prepare": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "hot_policy": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "device_copy": {
+              "cpu_ns": 0,
+              "calls": 0
+            }
+          },
+          "unattributed_cpu_ns": 0
+        },
+        {
+          "role": "harness",
+          "valid": true,
+          "cpu_ns": 14471000,
+          "stages": {
+            "get_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "put_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "encode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "decode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "submit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "poll": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "wait_backoff": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "qpl_execute_inclusive": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "background_step_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "merge": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "commit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "prepare": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "hot_policy": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "device_copy": {
+              "cpu_ns": 0,
+              "calls": 0
+            }
+          },
+          "unattributed_cpu_ns": 14471000
+        },
+        {
+          "role": "background",
+          "valid": true,
+          "cpu_ns": 420068000,
+          "stages": {
+            "get_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "put_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "encode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "decode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "submit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "poll": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "wait_backoff": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "qpl_execute_inclusive": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "background_step_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "merge": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "commit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "prepare": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "hot_policy": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "device_copy": {
+              "cpu_ns": 0,
+              "calls": 0
+            }
+          },
+          "unattributed_cpu_ns": 420068000
+        },
+        {
+          "role": "client",
+          "valid": true,
+          "cpu_ns": 611078000,
+          "stages": {
+            "get_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "put_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "encode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "decode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "submit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "poll": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "wait_backoff": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "qpl_execute_inclusive": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "background_step_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "merge": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "commit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "prepare": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "hot_policy": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "device_copy": {
+              "cpu_ns": 0,
+              "calls": 0
+            }
+          },
+          "unattributed_cpu_ns": 611078000
+        },
+        {
+          "role": "client",
+          "valid": true,
+          "cpu_ns": 615082000,
+          "stages": {
+            "get_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "put_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "encode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "decode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "submit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "poll": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "wait_backoff": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "qpl_execute_inclusive": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "background_step_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "merge": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "commit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "prepare": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "hot_policy": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "device_copy": {
+              "cpu_ns": 0,
+              "calls": 0
+            }
+          },
+          "unattributed_cpu_ns": 615082000
+        },
+        {
+          "role": "client",
+          "valid": true,
+          "cpu_ns": 619105000,
+          "stages": {
+            "get_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "put_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "encode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "decode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "submit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "poll": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "wait_backoff": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "qpl_execute_inclusive": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "background_step_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "merge": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "commit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "prepare": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "hot_policy": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "device_copy": {
+              "cpu_ns": 0,
+              "calls": 0
+            }
+          },
+          "unattributed_cpu_ns": 619105000
+        },
+        {
+          "role": "client",
+          "valid": true,
+          "cpu_ns": 617303000,
+          "stages": {
+            "get_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "put_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "encode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "decode_or_dispatch": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "submit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "poll": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "wait_backoff": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "qpl_execute_inclusive": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "background_step_other": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "merge": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "commit": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "prepare": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "hot_policy": {
+              "cpu_ns": 0,
+              "calls": 0
+            },
+            "device_copy": {
+              "cpu_ns": 0,
+              "calls": 0
+            }
+          },
+          "unattributed_cpu_ns": 617303000
+        }
+      ],
+      "thread_clock_complete": true,
+      "process_minus_threads_ns": 12000,
+      "qpl_init_attempts": 0,
+      "qpl_init_successes": 0,
+      "stage_cpu_exclusive": true,
+      "qpl_execute_internal_split": "requires external stack profile"
+    },
+    "CROSS_CHECKS": {
+      "completion_checks": 84819,
+      "not_ready": 0
+    },
+    "CROSS_V3": {
+      "version": 3,
+      "enabled": true,
+      "backend": "cpu-contract-test",
+      "window": 4,
+      "accepted": 84819,
+      "terminal": 84819,
+      "failed": 0,
+      "busy": 0,
+      "peak_jobs": 4,
+      "submit_ns": 388810381,
+      "poll_ns": 10447426,
+      "ready_to_accept_ns": 1175772000,
+      "accepted_to_observed_ns": 1089722942,
+      "host_step_ns": 802735401,
+      "merge_ns": 22988919,
+      "commit_ns": 51479692,
+      "workspace_requested": 264768,
+      "workspace_usable": 296704,
+      "qpl_job_requested": 0,
+      "qpl_job_usable": 0,
+      "borrowed_peak_bytes": 143720,
+      "byte_limit": 1048576,
+      "byte_busy": 0
+    },
+    "TIMING_V2": {
+      "version": 2,
+      "completion_detection_ns": 737792,
+      "drain_call_ns": 47988209,
+      "enqueue_to_dequeue_ns": 23822664795,
+      "dequeue_to_start_ns": 0,
+      "legacy_async_counters_applicable": false
+    },
+    "MEMORY_V3": {
+      "version": 3,
+      "base_raw_record_bytes": 20400000,
+      "base_encoded_bytes": 13182937,
+      "base_format_bytes": 209472,
+      "base_blocks": 7142,
+      "raw_blocks": 28,
+      "tls_qpl_accounted_bytes": 0,
+      "qpl_private_memory_verified": true,
+      "huffman": "dynamic",
+      "block_raw_histogram_1KiB": [
+        0,
+        0,
+        7122,
+        20,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "HOT": {
+      "enabled": 1,
+      "crc": 0,
+      "warmup_gets": 8000,
+      "raw_gets": 0,
+      "raw_puts": 0,
+      "promotions": 0,
+      "demotions": 0,
+      "conflicts": 0,
+      "errors": 0,
+      "hot_used": 0,
+      "hot_peak": 0,
+      "hot_limit": 2097152,
+      "delta_used": 0,
+      "delta_peak": 1065792,
+      "delta_limit": 2040000,
+      "budget_denied": 0,
+      "policy_ns": 16181174,
+      "raw_requested": 0,
+      "raw_usable": 0
+    },
+    "HOT_BUDGET": {
+      "version": 1,
+      "work_signal": 0,
+      "owned_census": 0,
+      "target": 0,
+      "reserve": 4194304,
+      "denied": 0
+    },
+    "HOT_DRAIN": {
+      "sealed_partial_deltas": 2379,
+      "conversion_started": 0,
+      "conversion_finished": 0
+    },
+    "EXECUTION": {
+      "split_enabled": 0,
+      "verify_each": 0,
+      "arrival_rate": 0,
+      "latency_basis": "API-call-to-return",
+      "queue_samples": 543,
+      "queue_first": 0,
+      "queue_last": 0,
+      "queue_observed_peak": 32,
+      "routes": [
+        {
+          "requested": "not-applicable",
+          "calls": 0,
+          "completed": 0,
+          "failed": 0,
+          "input_bytes": 0,
+          "output_bytes": 0,
+          "ns": 0,
+          "busy": 0,
+          "last_error_status": 0
+        },
+        {
+          "requested": "not-applicable",
+          "calls": 0,
+          "completed": 0,
+          "failed": 0,
+          "input_bytes": 0,
+          "output_bytes": 0,
+          "ns": 0,
+          "busy": 0,
+          "last_error_status": 0
+        },
+        {
+          "requested": "not-applicable",
+          "calls": 0,
+          "completed": 0,
+          "failed": 0,
+          "input_bytes": 0,
+          "output_bytes": 0,
+          "ns": 0,
+          "busy": 0,
+          "last_error_status": 0
+        }
+      ],
+      "accel_observed": false,
+      "accel_counters": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "PRODUCT": {
+      "status": "ok",
+      "requested_backend": "lz4",
+      "actual_backend": "lz4",
+      "lz4_version": "1.9.4",
+      "keys": 150000,
+      "live_keys": 150000,
+      "seed": 11,
+      "shards": 8,
+      "threads": 4,
+      "library_version": "1.9.4",
+      "execution_path": "cpu",
+      "explicit_fallbacks": 0,
+      "include_trigger": 0,
+      "read_pct": 95,
+      "hot": 0,
+      "sparse": 0,
+      "random": 0,
+      "async": 1,
+      "audit": 0,
+      "trace_hash": "63462d2b225fa4ec",
+      "operations": 1000000,
+      "reads": 950206,
+      "writes": 49794,
+      "foreground_ns": 1663220500,
+      "completed_ns": 1711946542,
+      "cpu_ns": 2897094000,
+      "get_p99_ns": 5750,
+      "put_p99_ns": 1330417,
+      "get_p50_ns": 2334,
+      "put_p50_ns": 583,
+      "get_p999_ns": 195834,
+      "put_p999_ns": 7779541,
+      "live_kv_bytes": 20400000,
+      "preload_resident": 15283664,
+      "resident_usable": 16602064,
+      "audit_requested": 0,
+      "audit_usable": 0,
+      "audit_peak_usable": 0,
+      "preload_peak_usable": 0,
+      "audit_tracker_bytes": 65536,
+      "rss": 80543744,
+      "ru_maxrss_native": 80543744,
+      "wrapper_size": 48,
+      "leaf_metadata_size": 400,
+      "leaf_count": 2379,
+      "tree_metadata": 127272,
+      "tree_metadata_usable": 142784,
+      "leaf_metadata": 951600,
+      "leaf_metadata_usable": 1027728,
+      "active": 0,
+      "pending": 0,
+      "base_requested": 13392409,
+      "base_usable": 14593024,
+      "scheduler_requested": 806560,
+      "scheduler_usable": 838528,
+      "process_codec_workspace": 0,
+      "compress_calls": 34824,
+      "decompress_calls": 956633,
+      "write_lock_codec_calls": 0,
+      "queue_peak": 32,
+      "failed_tasks": 0,
+      "sync_fallbacks": 0,
+      "split_fallbacks": 0,
+      "mismatches": 0,
+      "fill_histogram": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        15,
+        125,
+        2234,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "JOBS": {
+      "submitted": 0,
+      "terminal": 0,
+      "failed": 0,
+      "busy": 0,
+      "outstanding": 0,
+      "queue_wait_ns": 23822664795
+    },
+    "PHASES": {
+      "decompress_ns": 0,
+      "merge_ns": 0,
+      "compress_and_allocate_ns": 0,
+      "commit_and_split_ns": 0,
+      "ready_at_wait_samples": 0
+    },
+    "WAITS": {
+      "admission_waits": 808,
+      "admission_ns": 1558460992,
+      "pending_or_resource_ns": 1600067999
+    },
+    "AGGREGATION": {
+      "layout": 3,
+      "mapping": 0,
+      "batch": 1,
+      "legacy_get": 0,
+      "stack_allocated_usable": 2703360,
+      "zstd_workspace": 0,
+      "zstd_version": "1.5.5",
+      "active_hits": 29482,
+      "pending_hits": 273,
+      "base_hits": 920451,
+      "pending_wait_ns": 1600067999,
+      "read_lock_wait_ns": 426544607,
+      "bypass_blocks": 368,
+      "merged_updates": 48289,
+      "merge_count": 16882,
+      "origins": [
+        {
+          "compress": 0,
+          "decompress": 906638,
+          "encode_bytes": 0,
+          "decode_bytes": 2591035008,
+          "encode_ns": 0,
+          "decode_ns": 1241286106,
+          "encode_failed": 0,
+          "decode_failed": 0
+        },
+        {
+          "compress": 34824,
+          "decompress": 49995,
+          "encode_bytes": 99551184,
+          "decode_bytes": 142964696,
+          "encode_ns": 482478439,
+          "decode_ns": 607244503,
+          "encode_failed": 0,
+          "decode_failed": 0
+        },
+        {
+          "compress": 0,
+          "decompress": 0,
+          "encode_bytes": 0,
+          "decode_bytes": 0,
+          "encode_ns": 0,
+          "decode_ns": 0,
+          "encode_failed": 0,
+          "decode_failed": 0
+        },
+        {
+          "compress": 0,
+          "decompress": 0,
+          "encode_bytes": 0,
+          "decode_bytes": 0,
+          "encode_ns": 0,
+          "decode_ns": 0,
+          "encode_failed": 0,
+          "decode_failed": 0
+        },
+        {
+          "compress": 0,
+          "decompress": 0,
+          "encode_bytes": 0,
+          "decode_bytes": 0,
+          "encode_ns": 0,
+          "decode_ns": 0,
+          "encode_failed": 0,
+          "decode_failed": 0
+        }
+      ]
+    },
+    "TEARDOWN": {
+      "before_thread_release": 0,
+      "after_thread_release": 0,
+      "allocations": 0
+    },
+    "CODEC_WORK": {
+      "compress": {
+        "version": 3,
+        "role": "compress",
+        "calls": 34824,
+        "failed": 0,
+        "input_bytes": 99551184,
+        "output_bytes": 62394761,
+        "input_histogram_1KiB": [
+          0,
+          0,
+          34663,
+          161,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "output_histogram_1KiB": [
+          477,
+          26967,
+          7380,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "get_decompress": {
+        "version": 3,
+        "role": "get_decompress",
+        "calls": 906638,
+        "failed": 0,
+        "input_bytes": 1570501262,
+        "output_bytes": 2591035008,
+        "input_histogram_1KiB": [
+          36421,
+          709919,
+          160298,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "output_histogram_1KiB": [
+          0,
+          0,
+          903006,
+          3632,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "maintenance_decompress": {
+        "version": 3,
+        "role": "maintenance_decompress",
+        "calls": 49995,
+        "failed": 0,
+        "input_bytes": 87203171,
+        "output_bytes": 142964696,
+        "input_histogram_1KiB": [
+          1748,
+          39145,
+          9102,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "output_histogram_1KiB": [
+          0,
+          0,
+          49723,
+          272,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "case": "uniform-r95-lz4-e1-d1-threads-0",
+    "point": "uniform-r95",
+    "mode": "performance",
+    "codec": "lz4",
+    "repeat": 0,
+    "profile": "threads",
+    "encode_scale": 1.0,
+    "decode_scale": 1.0,
+    "INPUT": {
+      "schema": 1,
+      "source": "real Silesia samba, complete 128B slices",
+      "archive_sha256": "285c06096c0e24b71e28705f489932482b23d823b306dddc1cd8d0a8145121a1",
+      "samba_sha256": "93ba07bc44d8267789c1d911992f40b089ffa2140b4a160fac11ccae9a40e7b2",
+      "samba_bytes": 21606400,
+      "keys": 150000,
+      "operations": 1000000,
+      "clients": 4,
+      "seed": 11,
+      "zipf_alpha": 0,
+      "read_pct": 95,
+      "rank_mapping": "clustered",
+      "payload_mapping": "adjacent",
+      "trace_sha256": "f540398d51517efacbb71c1fa46b8ef2e967e31222865e7dc6da8ae8d8dfb4fd",
+      "rank_map_sha256": "bfc6c9531ff703606a876b4a00c61c3133bccd9c7d41bd28b81e662d83d99d75",
+      "client_events": [
+        249581,
+        249847,
+        250533,
+        250039
+      ],
+      "worker_hashes": [
+        "e74554cddf640e98",
+        "d6d8a5fb0f2a0259",
+        "27d3728d17ccb1b2",
+        "7508ae90e5dd199f"
+      ],
+      "puts": 49794,
+      "updates_per_key": 0.33196,
+      "top_1pct_request_share": 0.00998,
+      "top_10pct_request_share": 0.099704,
+      "assumptions": [
+        "Synthetic finite Zipf arrival pattern, not a production trace",
+        "Single client owns each key for an exact latest-value oracle",
+        "Client load imbalance is reported, no padding counted as operations",
+        "Clustered/dispersed refers to popularity rank mapping, independent of payload mapping",
+        "Updates select another existing 128B samba slice, never mutate or pad the bytes",
+        "Fixed prefix read warmup, no future hot-set oracle"
+      ],
+      "update_rule": "slice=(payload_map[key-1]+version*7919)%samba_chunks; version=local_event_index*clients+client+1"
+    },
+    "CONFIG": {
+      "BTREE_CROSS_LEAF": "1",
+      "BTREE_CROSS_CPU_TEST": "1",
+      "BTREE_CROSS_OUTSTANDING": "4",
+      "BTREE_AGG_BACKPRESSURE": "1",
+      "BTREE_BG_COMPACTION": "1",
+      "BTREE_SHARDS": "8",
+      "BTREE_BG_INCLUDE_TRIGGER": "0",
+      "BTREE_REUSE_UNCHANGED_BLOCKS": "1",
+      "BTREE_CROSS_BYTES": "16777216",
+      "BTREE_DELTA_BYTES": "2040000",
+      "BTREE_HOT_BYTES": "2097152",
+      "BTREE_HOT_THRESHOLD": "64",
+      "BTREE_COLD_THRESHOLD": "8",
+      "BTREE_HOT_RESIDENCE": "4",
+      "BTREE_HOT_EPOCH_OPS": "8192",
+      "BTREE_QPL_PATH": "hardware",
+      "SD_ENCODE_US": "0",
+      "SD_DECODE_US": "0",
+      "SD_SLOTS": "32",
+      "HOT_DEVICE_US": "100",
+      "HOT_WARMUP": "2000",
+      "SD_ENCODE_PS_PER_BYTE": "1800",
+      "SD_DECODE_PS_PER_BYTE": "330",
+      "SD_SUBMIT_HOST_NS": "0",
+      "SD_POLL_HOST_NS": "0",
+      "HOT_ENCODE_NS": "3100",
+      "HOT_DECODE_NS": "900",
+      "BTREE_HOT_ENABLE": "1",
+      "BTREE_VERIFY_CRC": "0",
+      "BTREE_MEMORY_AUDIT": "0",
+      "AGG_VERIFY_EACH": "0",
+      "BTREE_HOT_TOTAL_BYTES": "0",
+      "BTREE_QPL_CROSS_HARDWARE": "1",
+      "BTREE_HOT_WORK_SIGNAL": "0",
+      "BTREE_CPU_PROFILE": "threads"
+    },
+    "elapsed_seconds": 4.0361738204956055,
+    "returncode": 0,
+    "status": "ok",
+    "evidence": "measured-software",
+    "STORAGE": {
+      "version": 1,
+      "cold_data_ratio": 1.547454865330844,
+      "cold_framed_ratio": 1.5232509700084578,
+      "codec_work_ratio": 1.5955054944436762,
+      "live_record_bytes": 20400000,
+      "cache_codec_retained_bytes": 16602064,
+      "execution_stack_bytes": 2703360,
+      "total_owned_retained_bytes": 19305424,
+      "total_owned_peak_bytes": null,
+      "memory_ledger_complete_for_scope": true,
+      "memory_scope": "cache, metadata, buffers, allocator usable bytes, codec/scheduler workspaces and benchmark execution stacks; excludes fixture, trace, timing arrays, audit tracker, shared libraries and OS runtime; RSS separate",
+      "retained_basis": "after final drain, not sustained-write steady state",
+      "peak_basis": "observed allocation high-water during measurement including drain; preload excluded",
+      "cold_data_basis": "current valid cold records / stored block payload including RAW bypass, excludes framing and hot RAW leaves; not cumulative codec traffic",
+      "raw_reference_retained_case": null,
+      "raw_reference_peak_case": null,
+      "raw_retained_bytes": null,
+      "raw_peak_bytes": null,
+      "tracked_memory_saved_retained_pct": null,
+      "tracked_memory_saved_peak_pct": null,
+      "memory_saved_retained_pct": null,
+      "memory_saved_peak_pct": null,
+      "capacity_retained_x": null,
+      "capacity_peak_x": null,
+      "capacity_gate": "unavailable",
+      "reason": "matched RAW unavailable"
+    }
+  }
+]

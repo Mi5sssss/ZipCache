@@ -1,8 +1,17 @@
 # ZipCache DRAM-tier B+Tree
 
-## WIP hardware evaluation: start here
+## Current workload and CPU evaluation
 
-On `wip/iaa-hybrid-evaluate`, the new self-contained experiment is in
+Use [`experiments/iaa-workload-profile`](experiments/iaa-workload-profile/README.md)
+for the bounded hot-leaf snapshot, strict QPL versus LZ4 comparison, host CPU
+profiling and separate memory audit. Its `run_intel.py` command performs the
+checks and three selected workload points, then produces one `summary.txt`.
+Real IAA performance, Linux perf and complete QPL-private memory remain hardware
+validation work. The branch name does not imply this screen tests hybrid routing.
+
+## Earlier cross-leaf evaluation
+
+The preceding self-contained experiment is preserved in
 [`experiments/iaa-async`](experiments/iaa-async/README_ASYNC_QPL.md).
 Follow [IAA_ASYNC_EVALUATION.md](IAA_ASYNC_EVALUATION.md) for the exact commands,
 comparison matrix, local verification and remaining hardware checks.

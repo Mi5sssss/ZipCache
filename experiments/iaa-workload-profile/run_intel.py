@@ -36,9 +36,10 @@ def commands(args, out):
     runner = [sys.executable, str(ROOT / 'run.py')]
     return [
         ('configure', ['cmake', '-S', str(ROOT / 'source/DRAM-tier/tests/btree_iaa'), '-B', str(build),
-                       '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DAGG_DISABLE_QPL=OFF']),
+                       '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DAGG_DISABLE_QPL=OFF',
+                       f'-DPython3_EXECUTABLE={sys.executable}']),
         ('build', ['cmake', '--build', str(build), '-j4']),
-        ('check', runner + ['check', '--build', str(build), '--out', str(out / 'check')]),
+        ('check', runner + ['check'] + common + ['--out', str(out / 'check')]),
         ('smoke', runner + ['intel'] + common + ['--points', 'uniform-r80', '--operations', '10000',
                     '--repeats', '1', '--out', str(out / 'smoke')]),
         ('performance', runner + ['intel'] + common + points + ['--out', str(out / 'performance')]),

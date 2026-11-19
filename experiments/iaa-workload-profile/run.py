@@ -10,6 +10,8 @@ from diagnose import parse_log
 from handoff_checks import qualify, build_provenance
 POINTS=[f'{locality}-r{reads}' for locality in ['uniform','clustered','dispersed'] for reads in [95,80,50,20]]
 INTEL_POINTS=['uniform-r80','clustered-r20','uniform-r95']
+# Explicit architectural registers avoid unsupported bits in vendor perf defaults.
+PERF_USER_REGS='ax,bx,cx,dx,si,di,bp,sp,ip,flags,cs,ss,r8,r9,r10,r11,r12,r13,r14,r15'
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def source_manifest():return {str(p.relative_to(ROOT/'source')):sha(p) for p in sorted((ROOT/'source').rglob('*')) if p.is_file() and '__pycache__' not in p.parts}
 def trace(point,ops):
@@ -111,7 +113,14 @@ def main():
             r=subprocess.run(cmd,capture_output=True,text=True);machine[' '.join(cmd)]={'returncode':r.returncode,'stdout':r.stdout,'stderr':r.stderr}
     (out/'machine.json').write_text(json.dumps(machine,indent=2)+'\n')
     if a.action=='check':
-        with (out/'ctest.log').open('w') as f:subprocess.run(['ctest','--test-dir',str(build),'--output-on-failure','-j4'],stdout=f,stderr=subprocess.STDOUT,check=True)
+        cmd=['ctest','--test-dir',str(build),'--output-on-failure','-j4']
+        env=os.environ.copy()
+        if a.cpu_list or a.numa_node is not None:
+            if platform.system()!='Linux' or not a.cpu_list or a.numa_node is None or a.numa_node<0:
+                p.error('Bound checks require Linux and both --cpu-list and a nonnegative --numa-node')
+            cmd=['numactl',f'--physcpubind={a.cpu_list}',f'--membind={a.numa_node}']+cmd
+            env.update(BTREE_QPL_CROSS_HARDWARE='1',SAMBA_ZIP_PATH=str(ROOT/'data/samba.zip'))
+        with (out/'ctest.log').open('w') as f:subprocess.run(cmd,stdout=f,stderr=subprocess.STDOUT,env=env,check=True)
         (out/'run-status.json').write_text(json.dumps({'status':'complete','action':a.action,'scope':'CTest; inspect log for skipped hardware tests'})+'\n')
         return
     if not (build/'hot_bench').exists():p.error('Build hot_bench first; see README.md')
@@ -141,7 +150,7 @@ def main():
             ctl=out/f'{case}.control';ack=out/f'{case}.ack';os.mkfifo(ctl);os.mkfifo(ack)
             fifo_fds=[os.open(ctl,os.O_RDWR),os.open(ack,os.O_RDWR)]
             env.update(ZIPCACHE_PERF_CONTROL=str(ctl),ZIPCACHE_PERF_ACK=str(ack))
-            cmd=['perf','record','--delay=-1','--control',f'fifo:{ctl},{ack}','-e','cpu-clock','-F','99','--call-graph','dwarf,16384','-o',str(out/f'{case}.perf.data'),'--']+cmd
+            cmd=['perf','record','--delay=-1','--control',f'fifo:{ctl},{ack}','-e','cpu-clock','-F','99','--call-graph','dwarf,16384',f'--user-regs={PERF_USER_REGS}','-o',str(out/f'{case}.perf.data'),'--']+cmd
           (out/f'{case}.command.json').write_text(json.dumps({'cmd':cmd,'env':{k:v for k,v in env.items() if k.startswith(('BTREE_','HOT_','AGG_','SD_','SAMBA_','ZIPCACHE_PERF_'))}},indent=2)+'\n')
           print(a.action,case,flush=True);start=time.time()
           execution_error=None

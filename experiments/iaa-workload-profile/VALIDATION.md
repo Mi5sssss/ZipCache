@@ -1,10 +1,52 @@
 # Local verification and hardware boundary
 
-This Git distribution preserves all 97 source files from the reviewed
+The original Git distribution preserved all 97 source files from the reviewed
 2026-11-02 workload/profile snapshot. The existing runner, CPU profiler, layout,
 hot/cold policy and backend execution strategy are unchanged. Distribution adds
 one orchestration entrypoint, frozen-input verification and minimal public test
 fixtures; it does not introduce a new scheduler or hybrid routing policy.
+
+## Local corrections (2026-11-04)
+
+The current worktree deviates from the published snapshot. Original
+`source-sha256.json` and `PUBLICATION_SHA256.json` remain unchanged; new results
+record the actual source hashes and build provenance.
+
+- The Intel entrypoint selects its active Python interpreter and passes CPU/NUMA
+  binding to the check stage. Bound checks enable hardware cross-decoding with
+  the bundled corpus. Unbound local checks retain their previous behavior.
+- Real-QPL cross-fuzz tests request hardware routing, dynamic Huffman and a
+  16 MiB cross-job reservation. This test-only reservation does not change the
+  performance or audit budgets. CPU-only builds retain their existing fallback.
+- The test-only rebuild equivalence helper verifies both decoded payloads.
+  Byte-identical output is not required because allocator-usable rounding can
+  legitimately choose RAW in only one of the two encodings.
+- Strict legacy QPL encode/decode errors now log status and buffer sizes.
+  No codec fallback, hot/cold policy, storage format or device setting changed.
+
+Validated on this host: all 114 CTests passed with no skips through the bound
+check runner; all 14 Python entrypoint/handoff tests passed; the 10,000-request
+LZ4/strict-IAA smoke completed with both rows validated. The three previously
+failing checks also passed in a CPU-only build. Full performance, profiling
+and memory-audit passes were not rerun for these corrections.
+
+### Perf compatibility correction
+
+The host's vendor perf 6.6 build rejects default DWARF sampling against its
+7.3 kernel with EINVAL and a misleading per-thread `cpu-clock` error. Explicit
+standard x86-64 registers work with the same event, DWARF stack size and FIFO
+measurement gate. The runner now specifies that register set, without
+system-wide sampling, fallback or permission changes.
+
+A native 10k LZ4/QPL diagnostic run completed with both rows validated and
+nonempty, symbolized perf call stacks (including QPL submit/execute paths).
+This small probe validates recording, not statistically useful profiling.
+
+The exact three-point, one-million-operation profile was subsequently rerun:
+all six LZ4/QPL rows validated, all six perf reports contained samples, and
+none reported lost samples. All 15 Python entrypoint/handoff tests passed.
+The original failed output directory was preserved; corrected profile results
+are in `results-profile-full-20261104-fixed`.
 
 ## Reviewed snapshot evidence
 

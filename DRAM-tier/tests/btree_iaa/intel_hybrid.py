@@ -45,7 +45,8 @@ def parser():
     p.add_argument("--layouts", nargs="+", type=int, choices=(2, 3), default=[3])
     p.add_argument("--mappings", nargs="+", choices=("adjacent", "permuted"), default=["adjacent", "permuted"])
     p.add_argument("--ownership", choices=("strided", "shuffled"), default="shuffled")
-    p.add_argument("--reads", nargs="+", type=int, choices=(0, 20, 50, 80, 95, 100), default=[80])
+    p.add_argument("--reads", nargs="+", type=int, default=[80],
+                   help="One or more integer GET percentages from 0 through 100")
     p.add_argument("--rates", nargs="+", type=int, default=[0], help="0 is unpaced screening only")
     p.add_argument("--get-slo-us", type=float)
     p.add_argument("--put-slo-us", type=float)
@@ -76,6 +77,8 @@ def validate(a):
         a.keys = 1024 if a.profile == "smoke" else 150000
     if not 32 <= a.keys <= 150000 or a.timeout < 1 or any(x < 0 or x > 100000000 for x in a.rates):
         raise ValueError("Invalid keys, rates or timeout")
+    if any(not 0 <= reads <= 100 for reads in a.reads):
+        raise ValueError("--reads percentages must be in 0..100")
     if any(len(x) != len(set(x)) for x in (a.clients, a.layouts, a.mappings, a.reads, a.rates)):
         raise ValueError("Duplicate experiment dimensions would overwrite results")
     if a.ops_per_client is not None and not 1 <= a.ops_per_client <= 100000000:

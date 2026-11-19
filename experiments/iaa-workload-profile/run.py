@@ -38,7 +38,7 @@ def summarize(out,rows):
       'LZ4: measured software. Surrogate: uncalibrated delays + COPY, NOT IAA performance or capacity.',
       '150k samba 128B values, 8 shards, 4 clients, window 4, 2MiB hot RAW ceiling.',
       'No total-storage admission guard in either performance path. Not equal-total-DRAM performance.',
-      'Finite closed-loop screen includes final drain; not sustained QPS, production locality, or hardware acceptance.',
+      'QPS includes final drain. At a positive offered rate p99 includes client backlog from scheduled arrival.',
       'Audit has CRC/oracle/allocation tracking on; its timing is NOT compared with performance.',
       'zlib rows measure software Deflate; qpl rows measure actual QPL output after strict hardware preflight. Stored ratio covers cold bases only.',
       'mode point codec rep QPS CPU_ns/op GET_p99_us PUT_p99_us hot_GET_pct GET_jobs/read comp_jobs/PUT status']
@@ -48,8 +48,10 @@ def summarize(out,rows):
         def v(x):return f'{x:.3f}'
         perf=r['mode']!='audit'
         lines.append(' '.join(map(str,[r['mode'],r['point'],r['codec'],r['repeat'],v(n*1e9/p['completed_ns']) if perf else 'not-timed',
-          v(p['cpu_ns']/n) if perf else 'not-timed',v(p['get_p99_ns']/1000) if perf else 'not-timed',v(p['put_p99_ns']/1000) if perf else 'not-timed',
-          v(100*h['raw_gets']/reads),v(work['get_decompress']['calls']/reads),v(work['compress']['calls']/writes),r['status']])))
+          v(p['cpu_ns']/n) if perf else 'not-timed',v(p['get_p99_ns']/1000) if perf and reads else 'n/a',v(p['put_p99_ns']/1000) if perf and writes else 'n/a',
+          v(100*h['raw_gets']/reads) if reads else 'n/a',
+          v(work['get_decompress']['calls']/reads) if reads else 'n/a',
+          v(work['compress']['calls']/writes) if writes else 'n/a',r['status']])))
     lines+=['','INPUTS AND EXECUTION (software outstanding is not hardware occupancy):']
     for r in rows:
         if r['status']!='ok':continue
@@ -95,10 +97,14 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('action',choices=['check','screen','diagnose','audit','sensitivity','overhead','intel','intel-profile','intel-audit'])
     p.add_argument('--out',type=Path,required=True);p.add_argument('--points');p.add_argument('--operations',type=int,default=1000000)
     p.add_argument('--repeats',type=int,default=3);p.add_argument('--build',type=Path,default=ROOT/'build');p.add_argument('--cpu-list');p.add_argument('--numa-node',type=int)
+    p.add_argument('--arrival-rate',type=int,default=0,help='Total scheduled requests/s across all clients; zero runs unpaced')
     p.add_argument('--perf',action='store_true',help='Linux intel-profile only; epoch-gated CPU call stacks, separate from performance')
     a=p.parse_args();points=a.points.split(',') if a.points else (INTEL_POINTS if a.action.startswith('intel') else POINTS)
-    if not set(points)<=set(POINTS) or len(set(points))!=len(points):p.error('Unknown or duplicate workload point')
+    valid_points = set(POINTS) | {f'uniform-r{pct}' for pct in range(101)}
+    if not set(points)<=valid_points or len(set(points))!=len(points):p.error('Unknown or duplicate workload point')
     if a.operations<=0 or a.repeats<=0:p.error('Operations and repeats must be positive')
+    if not 0<=a.arrival_rate<=100000000 or (a.arrival_rate and a.action not in ('intel','screen','audit','intel-audit')):
+        p.error('A positive --arrival-rate up to 100000000 requires a performance or audit run')
     if a.perf and (a.action!='intel-profile' or not shutil.which('perf')):p.error('--perf requires intel-profile and an already permitted perf installation')
     if a.action.startswith('intel') and (platform.system()!='Linux' or not a.cpu_list or a.numa_node is None):p.error('Intel requires Linux, explicit --cpu-list and --numa-node; no WQ/system changes are made.')
     out=a.out.resolve();out.mkdir(parents=True,exist_ok=False);build=a.build.resolve()
@@ -145,6 +151,7 @@ def main():
         for codec,enc,dec,profile in choices:
           case=f'{point}-{codec}-e{enc:g}-d{dec:g}-{profile}-{repeat}';mode='audit' if a.action in ('audit','intel-audit') else 'diagnostic' if a.action in ('diagnose','intel-profile') else 'performance'
           env=environment(codec,mode,profile,enc,dec);cmd=[str(build/'hot_bench'),codec,str(path)]
+          env['AGG_ARRIVAL_RATE']=str(a.arrival_rate)
           if a.action.startswith('intel'):cmd=['numactl',f'--physcpubind={a.cpu_list}',f'--membind={a.numa_node}']+cmd
           if a.perf:
             ctl=out/f'{case}.control';ack=out/f'{case}.ack';os.mkfifo(ctl);os.mkfifo(ack)
@@ -157,16 +164,17 @@ def main():
           try:
             with (out/f'{case}.log').open('w') as f:
               r=subprocess.Popen(cmd,env=env,stdout=f,stderr=subprocess.STDOUT,start_new_session=True)
-              try:r.wait(timeout=1200)
+              timeout=1200 + (max(m['client_events'])*m['clients']/a.arrival_rate if a.arrival_rate else 0)
+              try:r.wait(timeout=timeout)
               except subprocess.TimeoutExpired:
-                os.killpg(r.pid,signal.SIGKILL);r.wait();execution_error='benchmark timeout after 1200 seconds'
+                os.killpg(r.pid,signal.SIGKILL);r.wait();execution_error=f'benchmark timeout after {timeout:g} seconds'
           finally:
             if a.perf:
               for fd in fifo_fds:os.close(fd)
               ctl.unlink();ack.unlink()
           d=parse_log(out/f'{case}.log');d.update(case=case,point=point,mode=mode,codec=codec,repeat=repeat,profile=profile,encode_scale=enc,decode_scale=dec,
             INPUT=m,CONFIG={k:v for k,v in env.items() if k.startswith(('BTREE_','HOT_','AGG_','SD_'))},elapsed_seconds=time.time()-start,returncode=r.returncode,
-            RESOURCES={'cpu_list':a.cpu_list,'numa_node':a.numa_node,'scope':'whole process','background_window':4,'hot_bytes':2097152,'total_dram_cap_enforced':False},
+            RESOURCES={'cpu_list':a.cpu_list,'numa_node':a.numa_node,'scope':'whole process','background_window':4,'arrival_rate':a.arrival_rate,'hot_bytes':2097152,'total_dram_cap_enforced':False},
             status='ok' if r.returncode==0 else 'unavailable' if r.returncode==77 else 'failed',evidence='conditional-simulation-COPY' if codec=='surrogate' else 'strict-hardware' if codec=='qpl' else 'measured-software')
           if execution_error:d['execution_error']=execution_error
           qualify(d)

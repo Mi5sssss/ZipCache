@@ -64,6 +64,16 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(step['command'][at+1], '1')
             self.assertTrue(any(s.get('attribution') for s in plan['steps']))
 
+    def test_custom_read_percentages(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            plan = runner.build_plan(self.options(root, '--reads', '0', '87', '100'))
+            traces = [s['command'] for s in plan['steps'] if s['name'].startswith('trace-')]
+            self.assertEqual({cmd[cmd.index('--reads')+1] for cmd in traces}, {'0', '87', '100'})
+            for values in (['-1'], ['101'], ['87', '87']):
+                with self.assertRaises(ValueError):
+                    self.options(root, '--reads', *values)
+
     def test_qualification_and_validation(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

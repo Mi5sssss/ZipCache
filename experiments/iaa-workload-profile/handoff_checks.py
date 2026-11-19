@@ -31,7 +31,10 @@ def validate_result(row):
     require(bool(h['crc']) == audit and bool(p['audit']) == audit, 'CRC or allocation-audit mode differs from requested mode')
     execution = row['EXECUTION']
     require(bool(execution['verify_each']) == audit, 'per-read oracle enabled in wrong mode')
-    require(execution['arrival_rate'] == 0, 'unexpected offered-load mode')
+    rate = row.get('RESOURCES', {}).get('arrival_rate', 0)
+    require(execution['arrival_rate'] == rate, 'unexpected offered-load mode')
+    require(execution['latency_basis'] == ('scheduled-arrival-to-return' if rate else 'API-call-to-return'),
+            'latency clock differs from requested mode')
     a = row['AGGREGATION']
     require(a['layout'] == 3 and a['batch'] == 1 and not a['legacy_get'], 'wrong layout or payload-read API')
     require(p['threads'] == 4 and p['shards'] == 8, 'unexpected client/shard count')

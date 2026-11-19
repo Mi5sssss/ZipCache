@@ -12,6 +12,59 @@ establish IAA performance or a complete product result.
 
 ## Run on the IAA host
 
+To look for a change in the throughput lead as the GET percentage rises,
+run the four-leaf workload with the same CPU and NUMA placement for both codecs.
+The earlier four-leaf hardware screen used CPU list 0-32 and memory node 0.
+Use those settings on the same host to reproduce its endpoints:
+
+```sh
+export QPL_ROOT=/opt/qpl-1.9.0/qpl_build
+python3 run_intel.py --cpu-list 0-32 --numa-node 0 \
+  --reads $(seq 0 10 100) --out results-read-sweep
+```
+
+Supply any distinct integer percentages from 0 to 100. Each backend replays
+the same one-million-request uniform samba trace at each point, with four
+clients, four leaf slots and three paired runs in alternating backend order.
+The sweep runs the checks and smoke once, then the unpaced performance pairs.
+Return the top-level `summary.txt`. It shows median QPS including final drain,
+the range of paired gains and the tested intervals where the observed leader
+changes. Mixed signs are inconclusive. Refine only an interval of interest by
+passing additional percentages and a fresh output directory. If every point
+favors one backend, that is a valid result. To generate and verify just the
+inputs on any host, use `--reads 80 85 90 95 --prepare-only`.
+
+### Confirm the two sides of a change in the throughput lead
+
+On the same host, keep the sweep output directory and run:
+
+```sh
+python3 run_intel.py --confirm-from results-read-sweep \
+  --arrival-rate 80000 --out results-confirm
+```
+
+The command selects the two measured endpoints if the sweep found one change
+in the lead. For multiple changes, choose a reported interval with
+`--reads LOW HIGH`. If no change was resolved, return the sweep summary or
+refine the percentages. CPU placement, memory node and trace checksums are
+matched to the sweep. The rate is configurable and is the aggregate across
+four clients. Use a rate both backends can deliver, and check delivered QPS.
+
+The latency pass runs three pairs with alternating codec order. GET and PUT
+p99 run from scheduled arrival to return, including time queued at the client.
+A separate instrumented replay at the same offered rate measures RAW, LZ4 and
+strict QPL with identical inputs and full byte checks. The report separates
+cold stored-data ratio, tracked retained and peak cache bytes, and whole-process
+RSS. RSS includes the test harness and its lifetime peak includes preload.
+The cache ledger excludes unverified QPL-private allocations. A single
+`results-confirm/summary.txt` contains both the original throughput comparison
+and the confirmation results. On failure send the top-level summary from the
+affected stage. The detailed JSON and logs remain in the run directories.
+
+The older synchronous diagnostic at `DRAM-tier/tests/btree_iaa/intel_eval.py`
+also accepts arbitrary integer percentages through its existing `--reads`
+option. Compare results within each runner separately.
+
 Requirements: Linux x86-64, QPL **1.9.0**, configured and accessible IAA devices,
 CMake >=3.20, C/C++ compiler, Python >=3.9, pkg-config, LZ4/Zstd/zlib development
 libraries, unzip and numactl. Static QPL linking includes the C++ runtime.

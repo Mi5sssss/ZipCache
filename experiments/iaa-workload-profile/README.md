@@ -41,6 +41,11 @@ Use a new output directory each time. This single command:
    separate RAW/LZ4/QPL memory audit.
 5. Combines the results into **`results-20261102/summary.txt`**.
 
+The check stage uses the same CPU/NUMA binding as the workloads; QPL jobs must
+not migrate to a node without accessible userspace IAA workqueues. This worktree
+includes local check-stage corrections documented in [VALIDATION.md](VALIDATION.md)
+and no longer matches the original published source checksums.
+
 Please return that summary.txt and run-status.json. On failure, also return the
 named stage log. Detailed results.json, machine.json and build-provenance.json
 are retained in the stage directories for follow-up.
@@ -48,7 +53,10 @@ are retained in the stage directories for follow-up.
 If permitted perf is available, add `--perf`. It affects only the diagnostic
 profile and records CPU-clock stacks from request start through final drain,
 excluding preload and final verification. A perf error is explicit; there is no
-automatic permission change. The Linux perf wrapper still needs native validation.
+automatic permission change. DWARF recording explicitly requests the standard
+x86-64 integer, instruction-pointer, flags and CS/SS registers to avoid
+unsupported bits in vendor perf defaults. It remains process-scoped, not
+system-wide.
 
 ## Fixed comparisons
 
@@ -126,7 +134,8 @@ For individual hardware stages use `run.py intel`, `run.py intel-profile` or
 
 `data/samba.zip` reuses the identical corpus blob already in this repository.
 No new official-source verification is claimed. `expected-inputs.json` freezes
-the original trace manifests; `source-sha256.json` binds the 97 unchanged source
-files. Only the public entrypoint, trace preparation and test-fixture paths were
-adapted for Git distribution. Private correspondence, full historical logs,
+the original trace manifests; `source-sha256.json` binds the 97 originally published source
+files; current deviations are documented above. Only the public entrypoint,
+trace preparation and test-fixture paths were adapted for Git distribution.
+Private correspondence, full historical logs,
 local binaries and recordings are excluded.

@@ -1688,6 +1688,8 @@ static int codec_compress_bytes(struct bplus_tree_compressed *ct_tree,
             }
             __atomic_add_fetch(&ct_tree->qpl_errors, 1, __ATOMIC_RELAXED);
             if (qpl_hardware_strict(ct_tree)) {
+                fprintf(stderr, "ZipCache: strict QPL encode failed: status=%d input=%u output=%u capacity=%u\n",
+                        status, src_size, produced, dst_capacity);
                 return -1;
             }
         }
@@ -1891,6 +1893,8 @@ static int codec_decompress_bytes(struct bplus_tree_compressed *ct_tree,
             }
             __atomic_add_fetch(&ct_tree->qpl_errors, 1, __ATOMIC_RELAXED);
             if (qpl_hardware_strict(ct_tree)) {
+                fprintf(stderr, "ZipCache: strict QPL decode failed: status=%d input=%u output=%u capacity=%u\n",
+                        status, src_size, produced, dst_capacity);
                 return -1;
             }
         }
@@ -5812,8 +5816,12 @@ int bplus_tree_compressed_test_rebuild_equivalence(struct bplus_tree_compressed 
     uint8_t raw[COMPRESSED_LEAF_SIZE]={0},old[MAX_COMPRESSED_SIZE],decoded[COMPRESSED_LEAF_SIZE];
     memcpy(raw,pairs,count*sizeof(*pairs));
     int n=aggregate_compress(tree,&leaf,raw,sizeof(raw),old,sizeof(old));
-    int ok=n>0 && (size_t)n==image.size && !memcmp(old,image.data,image.size) &&
+    /* Allocator-usable rounding can select RAW in only one encoding. Compare
+     * both decoded records rather than requiring identical codec decisions. */
+    int ok=n>0 &&
         aggregate_decompress(tree,&leaf,(uint8_t *)image.data,(uint32_t)image.size,decoded,sizeof(decoded))>0 &&
+        !memcmp(decoded,pairs,count*sizeof(*pairs)) &&
+        aggregate_decompress(tree,&leaf,old,(uint32_t)n,decoded,sizeof(decoded))>0 &&
         !memcmp(decoded,pairs,count*sizeof(*pairs));
     compressed_page_image_destroy(&image);return ok?0:-1;
 }
